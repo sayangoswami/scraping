@@ -1,0 +1,9 @@
+streamlit
+pandas
+beautifulsoup4
+markdownify
+pydantic
+instructor
+openai
+tqdm
+camoufox
