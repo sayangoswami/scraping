@@ -3,40 +3,73 @@ import streamlit as st
 import pandas as pd
 import os
 import re
-
-CSV_FILE = "data/hedjobs.csv"  # can also be "data/cvjobs.csv", "data/ejmjobs.csv", "data/joejobs.csv"
+import glob
 
 # 1. Page Configuration (Wide Layout)
 st.set_page_config(
-    page_title="Data Editor App",
-    layout="wide", # This uses the full screen width instead of a narrow central column
+    page_title="Interactive Data Editor",
+    layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 2. Load data from the CSV file
-@st.cache_data
-def load_data(file_path):
-    if os.path.exists(file_path):
-        return pd.read_csv(file_path)
-    else:
-        return None
+# Available Files Configuration
+DATASET_OPTIONS = {
+    "HigherEdJobs (hedjobs.csv)": "data/hedjobs.csv",
+    "Chronicle Vitae (cvjobs.csv)": "data/cvjobs.csv",
+    "Econ Job Market (ejmjobs.csv)": "data/ejmjobs.csv",
+    "JOE Jobs (joejobs.csv)": "data/joejobs.csv",
+}
 
-# Initialize session state from CSV
-if "df" not in st.session_state:
-    st.session_state.df = load_data(CSV_FILE)
+# 2. Data Loading Function
+@st.cache_data
+def load_data(file_path: str):
+    if os.path.exists(file_path):
+        try:
+            return pd.read_csv(file_path)
+        except Exception as err:
+            st.error(f"Error parsing `{file_path}`: {err}")
+            return None
+    return None
+
+# 3. Sidebar: Dataset Selection & Refresh Controls
+st.sidebar.header("📁 Dataset Selection")
+
+selected_label = st.sidebar.selectbox(
+    "Choose Data Source",
+    options=list(DATASET_OPTIONS.keys()),
+    index=0
+)
+selected_file = DATASET_OPTIONS[selected_label]
+
+col_refresh, col_status = st.sidebar.columns([1, 1])
+refresh_clicked = col_refresh.button("🔄 Refresh Data", use_container_width=True)
+
+# 4. Session State & Schema Synchronization
+# Reset and reload if switching datasets or user explicitly triggered a refresh
+file_changed = st.session_state.get("current_file") != selected_file
+
+if file_changed or refresh_clicked or ("df" not in st.session_state):
+    if refresh_clicked:
+        st.cache_data.clear()
+
+    loaded_data = load_data(selected_file)
+    st.session_state.df = loaded_data.copy() if loaded_data is not None else None
+    st.session_state.current_file = selected_file
 
 st.title("Interactive Data Editor & Persistor")
+st.caption(f"Active file: `{selected_file}`")
 
-# Halt execution if the file does not exist
+# Halt execution if the selected file is missing
 if st.session_state.df is None:
-    st.error(f"⚠️ **File Not Found:** Could not locate `{CSV_FILE}`. Please place the file in the working directory and refresh the app.")
+    st.warning(f"⚠️ **File Not Found or Empty:** Could not load `{selected_file}`. Check if the file exists on disk.")
     st.stop()
 
-# Create a clean copy to apply filters onto
+# Work on a copy for filtering
 filtered_df = st.session_state.df.copy()
 
-# 3. Sidebar Filters
-st.sidebar.header("Filter Options")
+# 5. Sidebar: Dynamic Filters (Adapts to Active Schema)
+st.sidebar.markdown("---")
+st.sidebar.header("🔍 Filter Options")
 
 # NEW: Regex Global Search vs Standard Search Toggle
 search_mode = st.sidebar.radio("Search Type", ["Standard Text", "Regex Pattern"], horizontal=True)
@@ -53,78 +86,99 @@ if global_search:
         except Exception as e:
             st.sidebar.error(f"Invalid Regex: {e}")
     else:
-        mask = filtered_df.astype(str).apply(lambda x: x.str.contains(global_search, case=False, na=False)).any(axis=1)
+        mask = filtered_df.astype(str).apply(
+            lambda x: x.str.contains(global_search, case=False, na=False)
+        ).any(axis=1)
         filtered_df = filtered_df[mask]
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Column Specific Filters")
 
-# Loop through every column to create dynamic filters
+# Dynamically construct filters based on current dataframe columns
 for col in filtered_df.columns:
-    # 1. Filters for Numeric Columns (Integer / Float)
+    widget_key_prefix = f"{selected_file}_{col}"
+
+    # Numeric column filter
     if pd.api.types.is_numeric_dtype(filtered_df[col]):
-        min_val = float(st.session_state.df[col].min())
-        max_val = float(st.session_state.df[col].max())
+        valid_vals = st.session_state.df[col].dropna()
+        if not valid_vals.empty:
+            min_val = float(valid_vals.min())
+            max_val = float(valid_vals.max())
+            if min_val < max_val:
+                selected_range = st.sidebar.slider(
+                    f"Filter {col}",
+                    min_value=min_val,
+                    max_value=max_val,
+                    value=(min_val, max_val),
+                    key=f"{widget_key_prefix}_slider"
+                )
+                filtered_df = filtered_df[
+                    (filtered_df[col] >= selected_range[0]) &
+                    (filtered_df[col] <= selected_range[1])
+                ]
 
-        # Only create a slider if there is a range to filter
-        if min_val < max_val:
-            selected_range = st.sidebar.slider(
-                f"Filter {col}",
-                min_value=min_val,
-                max_value=max_val,
-                value=(min_val, max_val)
-            )
-            filtered_df = filtered_df[(filtered_df[col] >= selected_range[0]) & (filtered_df[col] <= selected_range[1])]
-
-    # 2. Filters for Text / Categorical Columns
+    # Categorical / Text column filter
     else:
-        # If there are fewer than 20 unique items, use a multi-select dropdown
-        unique_vals = filtered_df[col].dropna().unique()
-        if len(unique_vals) <= 20:
-            selected_vals = st.sidebar.multiselect(f"Select {col}", options=unique_vals, default=[])
+        unique_vals = [v for v in filtered_df[col].dropna().unique()]
+        if 0 < len(unique_vals) <= 20:
+            selected_vals = st.sidebar.multiselect(
+                f"Select {col}",
+                options=unique_vals,
+                default=[],
+                key=f"{widget_key_prefix}_multiselect"
+            )
             if selected_vals:
                 filtered_df = filtered_df[filtered_df[col].isin(selected_vals)]
         # Otherwise, fall back to a text search input for that column
         else:
-            col_search = st.sidebar.text_input(f"Search {col}", "")
+            col_search = st.sidebar.text_input(f"Search {col}", "", key=f"{widget_key_prefix}_text")
             if col_search:
-                filtered_df = filtered_df[filtered_df[col].astype(str).str.contains(col_search, case=False, na=False)]
+                filtered_df = filtered_df[
+                    filtered_df[col].astype(str).str.contains(col_search, case=False, na=False)
+                ]
 
-
-# 4. Data Editing Section
+# 6. Data Table Display & In-place Editing
 st.subheader("Edit Your Data Below")
-st.caption("💡 **Tip:** Click any column header to sort. Double-click cells to edit manually.")
+st.caption("💡 **Tip:** Click column headers to sort. Double-click cells to edit manually.")
 
 # Display interactive data editor
 edited_df = st.data_editor(
     filtered_df,
-    # num_rows="dynamic", # Enables adding/deleting rows
-    width='stretch',
-    height=550
+    width="stretch",
+    height=550,
+    key=f"editor_{selected_file}"
 )
 
-# Sync manual table edits straight into master session state immediately
+# Sync edits back to master dataframe
 if not edited_df.equals(filtered_df):
     st.session_state.df.update(edited_df)
     st.rerun()
 
-
-# 5. NEW: Bulk Commands Control Panel
+# 7. Bulk Operations Toolbar (Dynamic Column Options)
 st.markdown("---")
 st.subheader("🛠️ Bulk Operations Toolbar")
-st.caption("These commands will be applied only to your currently filtered view rows.")
+st.caption("Applies changes to the currently filtered rows.")
 
 bulk_col1, bulk_col2, bulk_col3 = st.columns([2, 2, 1])
 
 with bulk_col1:
-    target_column = st.selectbox("1. Choose Target Column", options=st.session_state.df.columns)
+    target_column = st.selectbox(
+        "1. Choose Target Column",
+        options=list(st.session_state.df.columns),
+        key=f"bulk_target_{selected_file}"
+    )
+
 with bulk_col2:
-    bulk_action = st.selectbox("2. Choose Action", options=[
-        "Set to specific value",
-        "Regex Search & Replace",
-        "Math: Multiply numbers",
-        "Math: Add to numbers"
-    ])
+    bulk_action = st.selectbox(
+        "2. Choose Action",
+        options=[
+            "Set to specific value",
+            "Regex Search & Replace",
+            "Math: Multiply numbers",
+            "Math: Add to numbers"
+        ],
+        key=f"bulk_action_{selected_file}"
+    )
 
 with bulk_col3:
     st.write(" ") # Padding for button alignment
@@ -170,23 +224,22 @@ if execute_bulk:
     except Exception as error:
         st.error(f"Failed to execute command: {error}")
 
-
-# 6. Save & Persistence Action Buttons
+# 8. Save & Export Controls
 st.markdown("---")
-col1, col2 = st.columns(2)
+col_save, col_dl = st.columns(2)
 
-with col1:
-    if st.button("💾 Permanent Save to Master CSV File", type="primary", use_container_width=True):
-        st.session_state.df.to_csv(CSV_FILE, index=False)
-        st.success(f"Changes permanently written to {CSV_FILE}!")
+with col_save:
+    if st.button(f"💾 Save Changes to `{os.path.basename(selected_file)}`", type="primary", use_container_width=True):
+        st.session_state.df.to_csv(selected_file, index=False)
+        st.success(f"Changes permanently written to `{selected_file}`!")
         st.cache_data.clear()
 
-with col2:
-    csv_download_data = edited_df.to_csv(index=False).encode('utf-8')
+with col_dl:
+    csv_download_data = edited_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="📥 Download Current View as CSV File",
+        label="📥 Download Current View as CSV",
         data=csv_download_data,
-        file_name="filtered_data_export.csv",
+        file_name=f"export_{os.path.basename(selected_file)}",
         mime="text/csv",
         use_container_width=True
     )
