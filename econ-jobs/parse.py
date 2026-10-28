@@ -1,4 +1,7 @@
 import glob
+import logging
+import os
+
 import pandas as pd
 import re
 from bs4 import BeautifulSoup
@@ -90,12 +93,42 @@ def find_key_value_in_html(soup, key_pattern, tag_type):
             return value
     return None
 
+def fix_date_format(df):
+    # 1. Convert to datetime, turning malformed rows into NaT (Not a Time)
+    review_start = pd.to_datetime(df["review_start"], errors="coerce", format="mixed")
+    deadline = pd.to_datetime(df["deadline"], errors="coerce", format="mixed")
+
+    # 2. Format the valid dates to a fixed format (e.g., 'YYYY-MM-DD')
+    formatted_review_start = review_start.dt.strftime("%Y-%m-%d")
+    formatted_deadline = deadline.dt.strftime("%Y-%m-%d")
+
+    # 3. Fill the NaT gaps with the original text column
+    formatted_review_start = formatted_review_start.fillna(df["review_start"])
+    formatted_deadline = formatted_deadline.fillna(df["deadline"])
+
+    df["review_start"] = formatted_review_start
+    df["deadline"] = formatted_deadline
+    return df
+
+
+def schemas_are_equal(df1, df2):
+    # Check if column names and their order are identical
+    names_match = df1.columns.equals(df2.columns)
+
+    # Check if column data types match perfectly
+    types_match = df1.dtypes.equals(df2.dtypes)
+
+    return names_match and types_match
+
 class JobParser(ABC):
-    def __init__(self):
+    def __init__(self, zipfile=None, html_dir=None):
         self.client = instructor.from_openai(
             OpenAI(base_url="http://localhost:11434/v1", api_key="ollama"),
             mode=instructor.Mode.JSON
         )
+        self.html_dir = html_dir
+        self.zipfile = zipfile
+        self.df = self.get_existing_data()
 
     @abstractmethod
     def _get_id(self, soup: BeautifulSoup):
@@ -122,18 +155,24 @@ class JobParser(ABC):
         """Return the path to the CSV file where job data is/will be stored."""
         pass
 
-    @abstractmethod
-    def _get_zip_file(self):
-        """Return the path to the ZIP file containing the HTML files."""
-        pass
+    def get_existing_data(self):
+        if os.path.exists(self._get_csv_path()):
+            return pd.read_csv(self._get_csv_path())
+        return None
 
     def get_files_from_zip(self):
-        zipfile = self._get_zip_file()
+        zipfile = self.zipfile()
         with ZipFile(zipfile, 'r') as zf:
             for file_name in zf.namelist():
                 if file_name.endswith('.html'):
                     with zf.open(file_name, 'r') as f:
                         yield file_name, f.read()
+
+    def get_files_from_dir(self):
+        for file_name in os.listdir(self.html_dir):
+            if file_name.endswith('.html'):
+                with open(os.path.join(self.html_dir, file_name), 'r') as f:
+                    yield file_name, f.read()
 
     def extract_basics(self, soup: BeautifulSoup):
         try:
@@ -157,69 +196,101 @@ class JobParser(ABC):
         record.update(job_requirements)
         return True
 
-    def extract_all(self, filenames: List[str]):
-        remaining = [f for f in filenames]
-        records = []
-        round = 1
-        while len(remaining) > 0:
-            print(f"Round {round}, {len(remaining)} remaining..")
-            for filename in remaining:
-                with open(filename, "r", encoding="utf-8") as f:
-                    html_content = f.read()
-                soup = BeautifulSoup(html_content, "html.parser")
-                record = self.extract_basics(soup)
-                if record is not None:
-                    if self.extract_advanced(record):
-                        records.append(record)
-                        remaining.remove(filename)
-                    else:
-                        print(f"Failed to extract advanced info from {filename}")
-                else:
-                    print(f"Failed to extract basic info from {filename}")
-            round += 1
-            if round > 10:
-                print(f"Reached max rounds, {len(remaining)} remaining still. Quitting.")
-                break
-        return pd.DataFrame(records)
-
-    def extract_all_from_zip(self):
+    def extract_all(self, enumerate_file):
         processed = []
         records = []
         n_failed = 0
-        for round in range(10):
+        for j in range(10):
+            print(f"Starting round {j + 1}")
             n_failed = 0
-            for filename, html_content in self.get_files_from_zip():
-                if filename in processed:
-                    continue
-                else:
-                    soup = BeautifulSoup(html_content, "html.parser")
-                    record = self.extract_basics(soup)
-                    if record is not None:
-                        if self.extract_advanced(record):
-                            records.append(record)
-                            processed.append(filename)
-                        else:
-                            n_failed += 1
-                            print(f"Failed to extract advanced info from {filename}")
-                    else:
-                        n_failed += 1
-                        print(f"Failed to extract basic info from {filename}")
+            for filename, html_content in enumerate_file():
+                if self.process_file(filename, html_content, processed, records):
+                    n_failed += 1
             if n_failed == 0:
                 break
             else:
                 print(f"{n_failed} items failed. trying again")
         if n_failed > 0:
             print(f"Reached max rounds, {n_failed} remaining still. Quitting.")
-        return pd.DataFrame(records)
+        return self.save_dataframe(records)
+
+    def extract_all_from_dir(self):
+        return self.extract_all(self.get_files_from_dir)
+        # processed = []
+        # records = []
+        # n_failed = 0
+        # for j in range(10):
+        #     print(f"Starting round {j+1}")
+        #     n_failed = 0
+        #     for filename, html_content in self.get_files_from_dir():
+        #         if self.process_file(filename, html_content, processed, records):
+        #             n_failed += 1
+        #     if n_failed == 0:
+        #         break
+        #     else:
+        #         print(f"{n_failed} items failed. trying again")
+        # if n_failed > 0:
+        #     print(f"Reached max rounds, {n_failed} remaining still. Quitting.")
+        # return self.save_dataframe(records)
+
+    def extract_all_from_zip(self):
+        return self.extract_all(self.get_files_from_zip)
+        # processed = []
+        # records = []
+        # n_failed = 0
+        # for j in range(10):
+        #     print(f"Starting round {j+1}")
+        #     n_failed = 0
+        #     for filename, html_content in self.get_files_from_zip():
+        #         if self.process_file(filename, html_content, processed, records):
+        #             n_failed += 1
+        #     if n_failed == 0:
+        #         break
+        #     else:
+        #         print(f"{n_failed} items failed. trying again")
+        # if n_failed > 0:
+        #     print(f"Reached max rounds, {n_failed} remaining still. Quitting.")
+        # return self.save_dataframe(records)
+
+    def process_file(self, filename: str, html_content, processed, records):
+        if filename in processed:
+            print(f"Skipping {filename} as it has already been processed.")
+            return True
+        else:
+            print(f"Processing {filename} ...")
+            soup = BeautifulSoup(html_content, "html.parser")
+            record = self.extract_basics(soup)
+            if record is not None:
+                if self.df and record['id'] in self.df['id'].values:
+                    print(f"Skipping {filename} as it already exists in the database.")
+                    return True
+                if self.extract_advanced(record):
+                    records.append(record)
+                    processed.append(filename)
+                    print(f"Done.")
+                    return True
+                else:
+                    print(f"Failed to extract advanced info from {filename}")
+                    return False
+            else:
+                print(f"Failed to extract basic info from {filename}")
+                return False
+
+    def save_dataframe(self, records):
+        df = pd.DataFrame(records)
+        df = fix_date_format(df)
+        df['status'] = '...'
+        if self.df:
+            if schemas_are_equal(df, self.df):
+                df = pd.concat([self.df, df], axis=0, ignore_index=True)
+                print("Merged dataframes.")
+            else:
+                print("Schema mismatch. Cannot merge.")
+        else:
+            print("No existing data found. This is likely the first run.")
+        return df
 
 class HigherEdJobParser(JobParser):
-    def __init__(self, zipfile):
-        super().__init__()
-        self.zipfile = zipfile
-
-    def _get_zip_file(self):
-        pass
-
     def _get_id(self, soup: BeautifulSoup):
         spans = soup.find_all('span', {'data-jc': True}, recursive=True)
         if spans:
@@ -249,12 +320,12 @@ class HigherEdJobParser(JobParser):
 
 
 class ChronicleVitaeParser(JobParser):
-    def __init__(self, zipfile):
-        super().__init__()
-        self.zipfile = zipfile
 
     def _get_zip_file(self):
-        pass
+        return self.zipfile
+
+    def _get_html_dir(self):
+        return self.html_dir
 
     def _get_id(self, soup: BeautifulSoup):
         soup.find('title').string.split('|')[-1].strip()
@@ -281,3 +352,11 @@ class ChronicleVitaeParser(JobParser):
 
 class EconJobMarketParser(JobParser):
     pass
+
+def main():
+    parser = ChronicleVitaeParser(html_dir="data/html_cache/cv")
+    df = parser.extract_all_from_dir()
+    df.to_csv('data/output.csv', index=False)
+
+if __name__ == "__main__":
+    main()
