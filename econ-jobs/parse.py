@@ -1,5 +1,3 @@
-import glob
-import logging
 import os
 
 import pandas as pd
@@ -11,11 +9,12 @@ from typing import List, Dict
 from pydantic import BaseModel, Field
 import instructor
 from openai import OpenAI
-from tqdm import tqdm
 from zipfile import ZipFile
 from abc import ABC, abstractmethod
 
-QWEN_MODEL = "qwen2.5:3b"
+# run `ollama run qwen2.5:14b`
+# Alternatively, if you want an absolute speed demon that uses less VRAM, run ollama run llama3.1:8b or ollama run phi4:14b
+MODEL = "qwen2.5:14b"   # could also be "phi4-mini:latest" or "qwen2.5:7b", or even "qwen2.5:14b" for the desktop
 
 # 1. Define schema for categorized keywords
 class JobKeywords(BaseModel):
@@ -42,7 +41,7 @@ class RequiredDocuments(BaseModel):
 # 4. Extract keywords and requirements
 def extract_from_post(client, job_description):
     extracted = client.chat.completions.create(
-        model=QWEN_MODEL,
+        model=MODEL,
         response_model=JobKeywords,
         messages=[
             {
@@ -59,7 +58,7 @@ def extract_from_post(client, job_description):
 
 def extract_requirements_from_post(client, job_description):
     extracted = client.chat.completions.create(
-        model=QWEN_MODEL,
+        model=MODEL,
         response_model=RequiredDocuments,
         messages=[
             {
@@ -112,13 +111,13 @@ def fix_date_format(df):
 
 
 def schemas_are_equal(df1, df2):
-    # Check if column names and their order are identical
-    names_match = df1.columns.equals(df2.columns)
+    # Compare column names only: dtypes differ between a fresh frame and one read back from CSV
+    return set(df1.columns) == set(df2.columns)
 
-    # Check if column data types match perfectly
-    types_match = df1.dtypes.equals(df2.dtypes)
 
-    return names_match and types_match
+def is_macos_metadata(file_name):
+    # macOS zips include AppleDouble files (__MACOSX/..., ._name.html) that are not HTML
+    return file_name.startswith('__MACOSX/') or os.path.basename(file_name).startswith('._')
 
 class JobParser(ABC):
     def __init__(self, zipfile=None, html_dir=None):
@@ -157,21 +156,20 @@ class JobParser(ABC):
 
     def get_existing_data(self):
         if os.path.exists(self._get_csv_path()):
-            return pd.read_csv(self._get_csv_path())
+            return pd.read_csv(self._get_csv_path(), dtype={"id": str})
         return None
 
     def get_files_from_zip(self):
-        zipfile = self.zipfile()
-        with ZipFile(zipfile, 'r') as zf:
+        with ZipFile(self.zipfile, 'r') as zf:
             for file_name in zf.namelist():
-                if file_name.endswith('.html'):
+                if file_name.endswith('.html') and not is_macos_metadata(file_name):
                     with zf.open(file_name, 'r') as f:
                         yield file_name, f.read()
 
     def get_files_from_dir(self):
         for file_name in os.listdir(self.html_dir):
-            if file_name.endswith('.html'):
-                with open(os.path.join(self.html_dir, file_name), 'r') as f:
+            if file_name.endswith('.html') and not is_macos_metadata(file_name):
+                with open(os.path.join(self.html_dir, file_name), 'rb') as f:
                     yield file_name, f.read()
 
     def extract_basics(self, soup: BeautifulSoup):
@@ -182,29 +180,33 @@ class JobParser(ABC):
                 "link": self._get_link(soup),
                 "date_posted": self._get_date_posted(soup),
             }
-            return record
         except Exception as e:
+            print(f"Error extracting basic info: {e!r}")
             return None
+        if not record["id"] or not record["text"]:
+            return None
+        return record
 
     def extract_advanced(self, record: Dict):
         try:
             job_info = extract_from_post(self.client, record["text"])
             job_requirements = extract_requirements_from_post(self.client, record["text"])
         except Exception as e:
+            print(f"Error extracting advanced info: {e!r}")
             return False
         record.update(job_info)
         record.update(job_requirements)
         return True
 
     def extract_all(self, enumerate_file):
-        processed = []
+        processed = set()   # files done, or permanently unparseable; not retried
         records = []
         n_failed = 0
         for j in range(10):
             print(f"Starting round {j + 1}")
             n_failed = 0
             for filename, html_content in enumerate_file():
-                if self.process_file(filename, html_content, processed, records):
+                if not self.process_file(filename, html_content, processed, records):
                     n_failed += 1
             if n_failed == 0:
                 break
@@ -216,71 +218,46 @@ class JobParser(ABC):
 
     def extract_all_from_dir(self):
         return self.extract_all(self.get_files_from_dir)
-        # processed = []
-        # records = []
-        # n_failed = 0
-        # for j in range(10):
-        #     print(f"Starting round {j+1}")
-        #     n_failed = 0
-        #     for filename, html_content in self.get_files_from_dir():
-        #         if self.process_file(filename, html_content, processed, records):
-        #             n_failed += 1
-        #     if n_failed == 0:
-        #         break
-        #     else:
-        #         print(f"{n_failed} items failed. trying again")
-        # if n_failed > 0:
-        #     print(f"Reached max rounds, {n_failed} remaining still. Quitting.")
-        # return self.save_dataframe(records)
 
     def extract_all_from_zip(self):
         return self.extract_all(self.get_files_from_zip)
-        # processed = []
-        # records = []
-        # n_failed = 0
-        # for j in range(10):
-        #     print(f"Starting round {j+1}")
-        #     n_failed = 0
-        #     for filename, html_content in self.get_files_from_zip():
-        #         if self.process_file(filename, html_content, processed, records):
-        #             n_failed += 1
-        #     if n_failed == 0:
-        #         break
-        #     else:
-        #         print(f"{n_failed} items failed. trying again")
-        # if n_failed > 0:
-        #     print(f"Reached max rounds, {n_failed} remaining still. Quitting.")
-        # return self.save_dataframe(records)
 
     def process_file(self, filename: str, html_content, processed, records):
+        """Returns False only for failures worth retrying (the LLM step)."""
         if filename in processed:
-            print(f"Skipping {filename} as it has already been processed.")
             return True
-        else:
-            print(f"Processing {filename} ...")
-            soup = BeautifulSoup(html_content, "html.parser")
-            record = self.extract_basics(soup)
-            if record is not None:
-                if self.df and record['id'] in self.df['id'].values:
-                    print(f"Skipping {filename} as it already exists in the database.")
-                    return True
-                if self.extract_advanced(record):
-                    records.append(record)
-                    processed.append(filename)
-                    print(f"Done.")
-                    return True
-                else:
-                    print(f"Failed to extract advanced info from {filename}")
-                    return False
-            else:
-                print(f"Failed to extract basic info from {filename}")
-                return False
+        print(f"Processing {filename} ...")
+        soup = BeautifulSoup(html_content, "html.parser")
+        record = self.extract_basics(soup)
+        if record is None:
+            # Parsing is deterministic, so retrying would fail the same way
+            print(f"Failed to extract basic info from {filename}, skipping.")
+            processed.add(filename)
+            return True
+        if self.df is not None and record['id'] in self.df['id'].values:
+            print(f"Skipping {filename} as it already exists in the database.")
+            processed.add(filename)
+            return True
+        if any(r['id'] == record['id'] for r in records):
+            print(f"Skipping {filename} as a duplicate of an earlier file in this run.")
+            processed.add(filename)
+            return True
+        if self.extract_advanced(record):
+            records.append(record)
+            processed.add(filename)
+            print(f"Done.")
+            return True
+        print(f"Failed to extract advanced info from {filename}")
+        return False
 
     def save_dataframe(self, records):
+        if not records:
+            print("No new records extracted.")
+            return self.df if self.df is not None else pd.DataFrame()
         df = pd.DataFrame(records)
         df = fix_date_format(df)
         df['status'] = '...'
-        if self.df:
+        if self.df is not None:
             if schemas_are_equal(df, self.df):
                 df = pd.concat([self.df, df], axis=0, ignore_index=True)
                 print("Merged dataframes.")
@@ -328,18 +305,25 @@ class ChronicleVitaeParser(JobParser):
         return self.html_dir
 
     def _get_id(self, soup: BeautifulSoup):
-        soup.find('title').string.split('|')[-1].strip()
+        return soup.find('title').string.split('|')[-1].strip()
 
     def _get_text(self, soup: BeautifulSoup):
         attribs = ['job-description', 'company-information']
-        return get_markdown_from_attrs(soup, attribs)
+        text = get_markdown_from_attrs(soup, attribs)
+        if text:
+            return text
+        # Postings without a company tab have no tab ids; the body sits under a hidden "Job Details" heading
+        heading = soup.find('h2', string=re.compile(r'^\s*Job Details\s*$'))
+        if heading:
+            return md.markdownify(str(heading.parent))
+        return ""
 
     def _get_link(self, soup: BeautifulSoup):
         apply_link = soup.find('a', attrs={'data-hook': 'apply-button'})
-
-        # Get the href URL
-        url = str(apply_link['href'])
-        return 'jobs.chronicle.com' + url
+        # Expired postings have no apply button
+        if apply_link is None or not apply_link.get('href'):
+            return None
+        return 'https://jobs.chronicle.com' + apply_link['href']
 
     def _get_date_posted(self, soup: BeautifulSoup):
         # Pattern handles arbitrary whitespace/tabs and captures the date string
