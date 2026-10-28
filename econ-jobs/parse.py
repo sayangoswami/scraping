@@ -9,6 +9,7 @@ from typing import List, Dict
 from pydantic import BaseModel, Field
 import instructor
 from openai import OpenAI
+from tqdm import tqdm
 from zipfile import ZipFile
 from abc import ABC, abstractmethod
 
@@ -181,7 +182,7 @@ class JobParser(ABC):
                 "date_posted": self._get_date_posted(soup),
             }
         except Exception as e:
-            print(f"Error extracting basic info: {e!r}")
+            tqdm.write(f"Error extracting basic info: {e!r}")
             return None
         if not record["id"] or not record["text"]:
             return None
@@ -192,7 +193,7 @@ class JobParser(ABC):
             job_info = extract_from_post(self.client, record["text"])
             job_requirements = extract_requirements_from_post(self.client, record["text"])
         except Exception as e:
-            print(f"Error extracting advanced info: {e!r}")
+            tqdm.write(f"Error extracting advanced info: {e!r}")
             return False
         record.update(job_info)
         record.update(job_requirements)
@@ -202,10 +203,11 @@ class JobParser(ABC):
         processed = set()   # files done, or permanently unparseable; not retried
         records = []
         n_failed = 0
+        files = list(enumerate_file())
         for j in range(10):
-            print(f"Starting round {j + 1}")
+            pending = [(name, content) for name, content in files if name not in processed]
             n_failed = 0
-            for filename, html_content in enumerate_file():
+            for filename, html_content in tqdm(pending, desc=f"Round {j + 1}", unit="file"):
                 if not self.process_file(filename, html_content, processed, records):
                     n_failed += 1
             if n_failed == 0:
@@ -226,28 +228,26 @@ class JobParser(ABC):
         """Returns False only for failures worth retrying (the LLM step)."""
         if filename in processed:
             return True
-        print(f"Processing {filename} ...")
         soup = BeautifulSoup(html_content, "html.parser")
         record = self.extract_basics(soup)
         if record is None:
             # Parsing is deterministic, so retrying would fail the same way
-            print(f"Failed to extract basic info from {filename}, skipping.")
+            tqdm.write(f"Failed to extract basic info from {filename}, skipping.")
             processed.add(filename)
             return True
         if self.df is not None and record['id'] in self.df['id'].values:
-            print(f"Skipping {filename} as it already exists in the database.")
+            tqdm.write(f"Skipping {filename} as it already exists in the database.")
             processed.add(filename)
             return True
         if any(r['id'] == record['id'] for r in records):
-            print(f"Skipping {filename} as a duplicate of an earlier file in this run.")
+            tqdm.write(f"Skipping {filename} as a duplicate of an earlier file in this run.")
             processed.add(filename)
             return True
         if self.extract_advanced(record):
             records.append(record)
             processed.add(filename)
-            print(f"Done.")
             return True
-        print(f"Failed to extract advanced info from {filename}")
+        tqdm.write(f"Failed to extract advanced info from {filename}")
         return False
 
     def save_dataframe(self, records):
