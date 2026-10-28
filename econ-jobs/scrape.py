@@ -52,6 +52,18 @@ def extract_hed_links(page_html):
     homepage = "https://www.higheredjobs.com"
     return extract_posting_links(page_html, pattern, homepage)
 
+def extract_ejm_links(page_html):
+    # Absolute only: a relative /positions/N would also match other sites' URLs quoted in ad text
+    pattern = r'https://econjobmarket\.org/positions/\d+'
+    homepage = "https://econjobmarket.org"
+    return extract_posting_links(page_html, pattern, homepage)
+
+def extract_joe_links(page_html):
+    # Drop the per-session q= parameter; JOE_ID alone resolves to the listing
+    pattern = r'https://www\.aeaweb\.org/joe/listing\.php\?JOE_ID=[\d_-]+'
+    homepage = "https://www.aeaweb.org"
+    return extract_posting_links(page_html, pattern, homepage)
+
 class JobExtractor:
     def __init__(self, zipfile=None, output_zip=None):
         # Listing pages are read from this zip if given, else from adlist_pattern on disk
@@ -153,6 +165,26 @@ class CVJobsExtractor(JobExtractor):
         self.adlist_pattern = "data/cv/chrvt-p*.html"
         self.homepage = "https://jobs.chronicle.com/"
         self.link_extractor = extract_cv_links
+        super().__init__(zipfile, output_zip)
+
+
+class EJMJobsExtractor(JobExtractor):
+    def __init__(self, zipfile=None, output_zip=None):
+        self.website = "ejm"
+        self.linkfile = "data/ejmjobs.txt"
+        self.adlist_pattern = "data/ejm/p*.html"
+        self.homepage = "https://econjobmarket.org/positions"
+        self.link_extractor = extract_ejm_links
+        super().__init__(zipfile, output_zip)
+
+
+class JOEJobsExtractor(JobExtractor):
+    def __init__(self, zipfile=None, output_zip=None):
+        self.website = "joe"
+        self.linkfile = "data/joejobs.txt"
+        self.adlist_pattern = "data/joe/p*.html"
+        self.homepage = "https://www.aeaweb.org/joe/listings"
+        self.link_extractor = extract_joe_links
         super().__init__(zipfile, output_zip)
 
 
