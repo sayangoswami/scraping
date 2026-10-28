@@ -189,7 +189,8 @@ class JOEJobsExtractor(JobExtractor):
 
 
 async def main():
-    await CVJobsExtractor(zipfile="data/postings/cv.zip").download_pages()
+    await JOEJobsExtractor(zipfile="data/postings/joe.zip").download_pages()
+    # await CVJobsExtractor(zipfile="data/postings/cv.zip").download_pages()
 
 
 if __name__ == "__main__":

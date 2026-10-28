@@ -95,8 +95,8 @@ def find_key_value_in_html(soup, key_pattern, tag_type):
 
 def fix_date_format(df):
     # 1. Convert to datetime, turning malformed rows into NaT (Not a Time)
-    review_start = pd.to_datetime(df["review_start"], errors="coerce", format="mixed")
-    deadline = pd.to_datetime(df["deadline"], errors="coerce", format="mixed")
+    review_start = pd.to_datetime(df["review_start"], errors="coerce", format="mixed", utc=True)
+    deadline = pd.to_datetime(df["deadline"], errors="coerce", format="mixed", utc=True)
 
     # 2. Format the valid dates to a fixed format (e.g., 'YYYY-MM-DD')
     formatted_review_start = review_start.dt.strftime("%Y-%m-%d")
