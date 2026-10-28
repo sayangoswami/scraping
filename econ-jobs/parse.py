@@ -335,7 +335,74 @@ class ChronicleVitaeParser(JobParser):
 
 
 class EconJobMarketParser(JobParser):
-    pass
+    def _get_ad_div(self, soup: BeautifulSoup):
+        # Closed or removed postings render a "no longer available" page without this div
+        return soup.find('div', id=re.compile(r'^ad-\d+$'))
+
+    def _get_id(self, soup: BeautifulSoup):
+        ad_div = self._get_ad_div(soup)
+        if ad_div:
+            return ad_div['id'].removeprefix('ad-')
+        return None
+
+    def _get_text(self, soup: BeautifulSoup):
+        ad_div = self._get_ad_div(soup)
+        if ad_div is None:
+            return ""
+        # The enclosing card also holds the title, location, and deadline fields
+        card = ad_div.find_parent('div', class_='card') or ad_div
+        return md.markdownify(str(card))
+
+    def _get_link(self, soup: BeautifulSoup):
+        # Applications go through EJM itself, so the posting URL is the apply link
+        canonical = soup.find('link', rel='canonical')
+        if canonical:
+            return canonical.get('href')
+        return None
+
+    def _get_date_posted(self, soup: BeautifulSoup):
+        pattern = r'"datePosted"\s*:\s*"([^"]+)"'
+        return find_key_value_in_html(soup, pattern, 'script')
+
+    def _get_csv_path(self):
+        return "data/ejmjobs.csv"
+
+
+class JOEJobParser(JobParser):
+    def _get_id(self, soup: BeautifulSoup):
+        return find_key_value_in_html(soup, r'JOE ID Number:\s*([\d_-]+)', 'div')
+
+    def _get_text(self, soup: BeautifulSoup):
+        wrapper = soup.find('div', class_='listings-wrapper')
+        if wrapper is None:
+            return ""
+        # Copy before dropping the inline application scripts so the caller's soup is untouched
+        wrapper = BeautifulSoup(str(wrapper), "html.parser")
+        for tag in wrapper.find_all(['script', 'style']):
+            tag.decompose()
+        for tag in wrapper.find_all('a', href=re.compile(r'^javascript:')):
+            tag.unwrap()
+        return md.markdownify(str(wrapper))
+
+    def _get_link(self, soup: BeautifulSoup):
+        apply_link = soup.find('a', string=re.compile(r'Apply for This Job'))
+        # Listings that take applications through JOE use a javascript: link; fall back to the listing URL
+        if apply_link and apply_link.get('href', '').startswith('http'):
+            return apply_link['href']
+        joe_id = self._get_id(soup)
+        if joe_id:
+            return f"https://www.aeaweb.org/joe/listing.php?JOE_ID={joe_id}"
+        return None
+
+    def _get_date_posted(self, soup: BeautifulSoup):
+        # Shown as MM/DD/YYYY; convert to ISO like the other sites
+        date_posted = find_key_value_in_html(soup, r'Date Posted:\s*(\d{2}/\d{2}/\d{4})', 'div')
+        if date_posted:
+            return pd.to_datetime(date_posted, format="%m/%d/%Y").strftime("%Y-%m-%d")
+        return None
+
+    def _get_csv_path(self):
+        return "data/joejobs.csv"
 
 def main():
     parser = ChronicleVitaeParser(html_dir="data/html_cache/cv")

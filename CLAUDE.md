@@ -32,7 +32,7 @@ The three stages share data only through files under `econ-jobs/data/`:
    - Records whose `id` already exists in the site's CSV (`_get_csv_path`), or earlier in the same run, are skipped. New rows are merged with the existing CSV when the column sets match.
 3. **Review (`app.py`).** A Streamlit editor over the per-site CSVs listed in `DATASET_OPTIONS` (`hedjobs.csv`, `cvjobs.csv`, `ejmjobs.csv`, `joejobs.csv`). It supports filtering, bulk edits, and saving back to the same CSV. `parse.py` adds a `status` column for this manual triage.
 
-Site keys used across stages: `cv` = Chronicle Vitae (jobs.chronicle.com), `hedj` = HigherEdJobs, `ejm` = EconJobMarket, `joe` = AEA JOE. All four have scrapers; only `cv` and `hedj` have parsers (`EconJobMarketParser` is a stub, and there is no JOE parser).
+Site keys used across stages: `cv` = Chronicle Vitae (jobs.chronicle.com), `hedj` = HigherEdJobs, `ejm` = EconJobMarket, `joe` = AEA JOE. All four have scrapers (`scrape.py`) and parsers (`parse.py`). EJM pages carry JSON-LD and an `ad-<id>` div; JOE pages have no structured data, so fields are regex-matched from the text under `div.listings-wrapper`.
 
 ## Gotchas
 
