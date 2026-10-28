@@ -8,7 +8,7 @@ import re
 from os.path import exists
 from pathlib import Path
 from urllib.parse import unquote
-from zipfile import ZipFile
+from zipfile import ZipFile, ZIP_DEFLATED
 
 from camoufox import AsyncCamoufox
 
@@ -53,7 +53,7 @@ def extract_hed_links(page_html):
     return extract_posting_links(page_html, pattern, homepage)
 
 class JobExtractor:
-    def __init__(self, zipfile=None):
+    def __init__(self, zipfile=None, output_zip=None):
         # Listing pages are read from this zip if given, else from adlist_pattern on disk
         self.zipfile = zipfile
         if exists(self.linkfile):
@@ -62,8 +62,9 @@ class JobExtractor:
         else: self.existing_links = []
         self.lid = len(self.existing_links)
 
-        self.output_dir = Path(f"data/html_cache/{self.website}")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Downloaded pages are appended to this zip as <website>/<n>.html, the layout parse.py reads
+        self.output_zip = Path(output_zip or f"data/html_cache/{self.website}.zip")
+        self.output_zip.parent.mkdir(parents=True, exist_ok=True)
 
         self.new_links = self._extract_links()
 
@@ -87,6 +88,15 @@ class JobExtractor:
             links.extend(self.link_extractor(page_html))
         return _unique_in_order(links)
 
+    def _save_page(self, rendered_html):
+        # Reopen per page so the archive is complete on disk even if the run dies mid-way
+        entry_name = f"{self.website}/{self.lid}.html"
+        with ZipFile(self.output_zip, 'a', compression=ZIP_DEFLATED) as zf:
+            if entry_name in zf.namelist():
+                raise FileExistsError(f"{entry_name} already exists in {self.output_zip}")
+            zf.writestr(entry_name, rendered_html)
+        return entry_name
+
     async def download_pages(self):
         processed_links = []
         try:
@@ -105,10 +115,8 @@ class JobExtractor:
                         print(f"Visiting url {link} ...")
                         await page.goto(link, wait_until="domcontentloaded", timeout=20000)
                         rendered_html = await page.content()
-                        output_file = self.output_dir / f"{self.lid}.html"
-                        with open(output_file, "w") as f:
-                            f.write(rendered_html)
-                        print(f"Saved {len(rendered_html)} bytes in {self.lid}.html ({c} / {len(self.new_links)} files)")
+                        entry_name = self._save_page(rendered_html)
+                        print(f"Saved {len(rendered_html)} bytes in {self.output_zip}:{entry_name} ({c} / {len(self.new_links)} files)")
                         nsleep = random.uniform(20, 30)
                         print(f"Sleeping for {nsleep} seconds")
                         await asyncio.sleep(nsleep)
@@ -129,23 +137,23 @@ class JobExtractor:
 
 
 class HEdJobsExtractor(JobExtractor):
-    def __init__(self, zipfile=None):
+    def __init__(self, zipfile=None, output_zip=None):
         self.website = "hedj"
         self.linkfile = "data/hredjobs.txt"
         self.adlist_pattern = "data/hedj/hredjobs-p*.html"
         self.homepage = "https://www.higheredjobs.com/faculty"
         self.link_extractor = extract_hed_links
-        super().__init__(zipfile)
+        super().__init__(zipfile, output_zip)
 
 
 class CVJobsExtractor(JobExtractor):
-    def __init__(self, zipfile=None):
+    def __init__(self, zipfile=None, output_zip=None):
         self.website = "cv"
         self.linkfile = "data/cvjobs.txt"
         self.adlist_pattern = "data/cv/chrvt-p*.html"
         self.homepage = "https://jobs.chronicle.com/"
         self.link_extractor = extract_cv_links
-        super().__init__(zipfile)
+        super().__init__(zipfile, output_zip)
 
 
 async def main():
