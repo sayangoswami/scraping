@@ -31,6 +31,7 @@ The three stages share data only through files under `econ-jobs/data/`:
    - `extract_advanced` sends the markdownified text to the LLM via `instructor` (JSON mode) using the pydantic schemas `JobKeywords` and `RequiredDocuments`. Only these LLM failures are retried, for up to 10 rounds.
    - Records whose `id` already exists in the site's CSV (`_get_csv_path`), or earlier in the same run, are skipped. New rows are merged with the existing CSV when the column sets match.
 3. **Review (`app.py`).** A Streamlit editor over the per-site CSVs listed in `DATASET_OPTIONS` (`hedjobs.csv`, `cvjobs.csv`, `ejmjobs.csv`, `joejobs.csv`). It supports filtering, bulk edits, and saving back to the same CSV. `parse.py` adds a `status` column for this manual triage.
+   - On load, `rankings.py` fuzzy-matches each posting's `university` (using `location` to pin the US state) against `data/CarnegieClassification.csv` and looks up QS / Times ranks by IPEDS id (`Cuid` = `unitid`). The resulting `rank_flag` (`skip` = R1/R2, QS-ranked, or Times-ranked; `ok`; `no match`) and detail columns are read-only and dropped on save. Run `python rankings.py` to print all matches for checking.
 
 Site keys used across stages: `cv` = Chronicle Vitae (jobs.chronicle.com), `hedj` = HigherEdJobs, `ejm` = EconJobMarket, `joe` = AEA JOE. All four have scrapers (`scrape.py`) and parsers (`parse.py`). EJM pages carry JSON-LD and an `ad-<id>` div; JOE pages have no structured data, so fields are regex-matched from the text under `div.listings-wrapper`.
 

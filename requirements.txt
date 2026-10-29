@@ -7,3 +7,4 @@ instructor
 openai
 tqdm
 camoufox
+rapidfuzz
