@@ -65,6 +65,9 @@ def extract_joe_links(page_html):
     return extract_posting_links(page_html, pattern, homepage)
 
 class JobExtractor:
+    # Sites with their own extractor stop at the first failure; MiscJobsExtractor moves on
+    skip_failed_links = False
+
     def __init__(self, zipfile=None, output_zip=None):
         # Listing pages are read from this zip if given, else from adlist_pattern on disk
         self.zipfile = zipfile
@@ -100,6 +103,12 @@ class JobExtractor:
             links.extend(self.link_extractor(page_html))
         return _unique_in_order(links)
 
+    def _prepare_html(self, link, rendered_html):
+        return rendered_html
+
+    async def _wait_for_content(self, page):
+        pass
+
     def _save_page(self, rendered_html):
         # Reopen per page so the archive is complete on disk even if the run dies mid-way
         entry_name = f"{self.website}/{self.lid}.html"
@@ -118,15 +127,27 @@ class JobExtractor:
                     os=["macos"],  # Randomly impersonates Windows or macOS fingerprint
             ) as browser:
                 page = await browser.new_page()
-                await page.goto(self.homepage, wait_until="domcontentloaded", timeout=20000)
-                await asyncio.sleep(random.randint(3, 5))
+                if self.homepage:
+                    await page.goto(self.homepage, wait_until="domcontentloaded", timeout=20000)
+                    await asyncio.sleep(random.randint(3, 5))
 
                 c = 1
                 for link in self.new_links:
                     if link not in self.existing_links:
                         print(f"Visiting url {link} ...")
-                        await page.goto(link, wait_until="domcontentloaded", timeout=20000)
-                        rendered_html = await page.content()
+                        try:
+                            response = await page.goto(link, wait_until="domcontentloaded", timeout=20000)
+                            if self.skip_failed_links and response is not None and not response.ok:
+                                raise RuntimeError(f"HTTP {response.status}")
+                            await self._wait_for_content(page)
+                            rendered_html = self._prepare_html(link, await page.content())
+                        except Exception as e:
+                            if not self.skip_failed_links:
+                                raise
+                            # Not recorded in the link file, so the next run retries it
+                            print(f"⚠️ Failed ({e!r}), skipping ({c} / {len(self.new_links)}): {link}")
+                            c += 1
+                            continue
                         entry_name = self._save_page(rendered_html)
                         print(f"Saved {len(rendered_html)} bytes in {self.output_zip}:{entry_name} ({c} / {len(self.new_links)} files)")
                         nsleep = random.uniform(20, 30)
@@ -188,8 +209,38 @@ class JOEJobsExtractor(JobExtractor):
         super().__init__(zipfile, output_zip)
 
 
+class MiscJobsExtractor(JobExtractor):
+    """Postings from any site, listed one URL per line in data/miscjobs.txt (no listing pages)."""
+    skip_failed_links = True
+
+    def __init__(self, zipfile=None, output_zip=None):
+        self.website = "misc"
+        self.urlfile = "data/miscjobs.txt"
+        # Visited URLs go in a separate file, since miscjobs.txt is the hand-written input
+        self.linkfile = "data/miscjobs_visited.txt"
+        self.homepage = None   # the links span many sites, so there is no single homepage to warm up on
+        super().__init__(zipfile, output_zip)
+
+    def _extract_links(self):
+        with open(self.urlfile, 'r') as file:
+            links = [line.strip() for line in file]
+        return _unique_in_order(link for link in links if link and not link.startswith('#'))
+
+    async def _wait_for_content(self, page):
+        # Some sites (Taleo, Seek) render the posting with JavaScript after the DOM is loaded
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+
+    def _prepare_html(self, link, rendered_html):
+        # Same comment Chrome's "Save Page As" writes; parse.MiscJobParser reads the URL from it
+        return f"<!-- saved from url=({len(link):04d}){link} -->\n{rendered_html}"
+
+
 async def main():
-    await JOEJobsExtractor(zipfile="data/postings/joe.zip").download_pages()
+    await MiscJobsExtractor().download_pages()
+    # await JOEJobsExtractor(zipfile="data/postings/joe.zip").download_pages()
     # await CVJobsExtractor(zipfile="data/postings/cv.zip").download_pages()
 
 

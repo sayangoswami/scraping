@@ -8,3 +8,4 @@ openai
 tqdm
 camoufox
 rapidfuzz
+trafilatura

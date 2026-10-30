@@ -1,9 +1,13 @@
+import hashlib
+import json
 import os
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import re
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 import markdownify as md
+import trafilatura
 
 from typing import List, Dict
 from pydantic import BaseModel, Field
@@ -92,6 +96,42 @@ def find_key_value_in_html(soup, key_pattern, tag_type):
             value = match.group(1)
             return value
     return None
+
+def get_job_posting_ld(soup):
+    """The schema.org JobPosting in the page's JSON-LD, or None.
+    Other JSON-LD types (WebPage, etc.) describe the page itself, so their dates and URLs are ignored."""
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string or "", strict=False)
+        except json.JSONDecodeError:
+            continue
+        items = data if isinstance(data, list) else data.get('@graph', [data])
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            types = item.get('@type')
+            if types == 'JobPosting' or (isinstance(types, list) and 'JobPosting' in types):
+                return item
+    return None
+
+
+def find_labelled_value(soup, label_pattern):
+    """Text following a label element, e.g. <th>Placed On:</th><td>29th September 2026</td>
+    or <span>Date posted</span><span>2026-09-17</span>."""
+    for label in soup.find_all(string=re.compile(rf'^\s*(?:{label_pattern})\s*:?\s*$', re.IGNORECASE)):
+        for sibling in label.parent.next_siblings:
+            text = sibling.get_text(" ", strip=True) if hasattr(sibling, 'get_text') else sibling.strip()
+            if text:
+                return text
+    return None
+
+
+def to_iso_date(value):
+    if not value:
+        return None
+    date = pd.to_datetime(value, errors="coerce")
+    return None if pd.isna(date) else date.strftime("%Y-%m-%d")
+
 
 def fix_date_format(df):
     # 1. Convert to datetime, turning malformed rows into NaT (Not a Time)
@@ -403,6 +443,87 @@ class JOEJobParser(JobParser):
 
     def _get_csv_path(self):
         return "data/joejobs.csv"
+
+
+class MiscJobParser(JobParser):
+    """Pages from any other site, without per-site rules. Basic fields come only from JSON-LD,
+    meta tags, and labelled text, so missing ones are left empty for filling in by hand."""
+
+    def _get_page_url(self, soup: BeautifulSoup):
+        # Chrome's "Save Page As" records the source URL in a comment
+        saved_from = soup.find(string=lambda s: isinstance(s, Comment) and 'saved from url=' in s)
+        if saved_from:
+            match = re.search(r'saved from url=\(\d+\)(\S+)', saved_from)
+            if match:
+                return match.group(1)
+        job = get_job_posting_ld(soup)
+        if job is None:
+            # Without a JobPosting the canonical URL is often a search or listing page shared by every job
+            return None
+        if job.get('url'):
+            return job['url']
+        canonical = soup.find('link', rel='canonical') or soup.find('meta', property='og:url')
+        if canonical:
+            return canonical.get('href') or canonical.get('content')
+        return None
+
+    def _get_id(self, soup: BeautifulSoup):
+        page_url = self._get_page_url(soup)
+        key = page_url or self._get_text(soup)
+        if not key:
+            return None
+        site = urlparse(page_url).netloc.removeprefix('www.') if page_url else 'misc'
+        return f"{site}-{hashlib.sha1(key.encode()).hexdigest()[:10]}"
+
+    def _get_text(self, soup: BeautifulSoup):
+        job = get_job_posting_ld(soup) or {}
+        # Fields that often sit in a sidebar the text extraction drops
+        header = []
+        if job.get('title'):
+            header.append(f"# {job['title']}")
+        organization = job.get('hiringOrganization')
+        if isinstance(organization, dict) and organization.get('name'):
+            header.append(f"Organization: {organization['name']}")
+        locations = job.get('jobLocation') or []
+        for location in locations if isinstance(locations, list) else [locations]:
+            address = location.get('address') if isinstance(location, dict) else None
+            if isinstance(address, dict):
+                parts = [address.get(k) for k in ('addressLocality', 'addressRegion', 'addressCountry')]
+                parts = [p.get('name') if isinstance(p, dict) else p for p in parts]
+                header.append("Location: " + ", ".join(p for p in parts if p))
+        if job.get('validThrough'):
+            header.append(f"Closing date: {job['validThrough']}")
+
+        if job.get('description'):
+            body = md.markdownify(job['description'])
+        else:
+            # favor_recall keeps bulleted lists, which the default settings drop on some sites
+            body = trafilatura.extract(
+                str(soup), output_format="markdown", include_tables=True, favor_recall=True
+            )
+        if not body:
+            return ""
+        return "\n".join(header + ["", body]).strip()
+
+    def _get_link(self, soup: BeautifulSoup):
+        page_url = self._get_page_url(soup)
+        for anchor in soup.find_all('a', href=True):
+            if re.search(r'\bapply\b', anchor.get_text(" ", strip=True), re.IGNORECASE):
+                href = urljoin(page_url, anchor['href']) if page_url else anchor['href']
+                if href.startswith('http'):
+                    return href
+        # No apply button (e.g. expired postings): fall back to the posting itself
+        return page_url
+
+    def _get_date_posted(self, soup: BeautifulSoup):
+        job = get_job_posting_ld(soup)
+        if job and job.get('datePosted'):
+            return to_iso_date(job['datePosted'])
+        label = r'date posted|posted on|placed on|date published|published on|date listed|listed on'
+        return to_iso_date(find_labelled_value(soup, label))
+
+    def _get_csv_path(self):
+        return "data/miscjobs.csv"
 
 def main():
     parser = ChronicleVitaeParser(html_dir="data/html_cache/cv")

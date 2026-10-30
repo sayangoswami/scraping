@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import datetime as dt
+import glob
 import os
 import re
 
@@ -14,13 +15,32 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Available Files Configuration
-DATASET_OPTIONS = {
-    "HigherEdJobs (hedjobs.csv)": "data/hedjobs.csv",
-    "Chronicle Vitae (cvjobs.csv)": "data/cvjobs.csv",
-    "Econ Job Market (ejmjobs.csv)": "data/ejmjobs.csv",
-    "JOE Jobs (joejobs.csv)": "data/joejobs.csv",
+# Available Files Configuration: every data/*jobs.csv is offered (rescanned on each rerun),
+# so a new site's CSV shows up without code changes. Known sites get a display name and come first.
+DATASET_PATTERN = "data/*jobs.csv"
+DATASET_NAMES = {
+    "alljobs.csv": "All sites, merged",
+    "hedjobs.csv": "HigherEdJobs",
+    "cvjobs.csv": "Chronicle Vitae",
+    "ejmjobs.csv": "Econ Job Market",
+    "joejobs.csv": "JOE Jobs",
+    "miscjobs.csv": "Miscellaneous",
 }
+
+
+def find_datasets():
+    paths = glob.glob(DATASET_PATTERN)
+    order = list(DATASET_NAMES)
+    paths.sort(key=lambda p: (order.index(os.path.basename(p)) if os.path.basename(p) in order else len(order), p))
+    options = {}
+    for path in paths:
+        file_name = os.path.basename(path)
+        name = DATASET_NAMES.get(file_name, file_name.removesuffix(".csv"))
+        options[f"{name} ({file_name})"] = path
+    return options
+
+
+DATASET_OPTIONS = find_datasets()
 
 # Columns that get date-range filters instead of text filters (when present)
 DATE_COLUMNS = ["date_posted", "review_start", "deadline"]
@@ -87,10 +107,16 @@ def invalidate_view():
 # 3. Sidebar: Dataset Selection & Refresh Controls
 st.sidebar.header("📁 Dataset Selection")
 
+if not DATASET_OPTIONS:
+    st.warning(f"⚠️ No datasets found matching `{DATASET_PATTERN}`.")
+    st.stop()
+
+# Keyed so the current choice survives a new CSV appearing in the list
 selected_label = st.sidebar.selectbox(
     "Choose Data Source",
     options=list(DATASET_OPTIONS.keys()),
-    index=0
+    index=0,
+    key="dataset"
 )
 selected_file = DATASET_OPTIONS[selected_label]
 
