@@ -31,6 +31,9 @@ def _unique_in_order(items):
 
     return unique
 
+def _strip_query(link):
+    return link.split("?", 1)[0]
+
 def extract_posting_links(page_html, pattern, homepage):
     text = unquote(html.unescape(page_html))
     matches = re.findall(pattern, text, flags=re.IGNORECASE)
@@ -45,12 +48,20 @@ def extract_posting_links(page_html, pattern, homepage):
 def extract_cv_links(page_html):
     pattern = r'(?:https://jobs\.chronicle\.com)?/job/\d+[^"\'<>\s]*'
     homepage = "https://jobs.chronicle.com"
-    return extract_posting_links(page_html, pattern, homepage)
+    return _unique_in_order(_strip_query(link) for link in extract_posting_links(page_html, pattern, homepage))
+
+def _cv_job_id(link):
+    return re.search(r'/job/(\d+)', link).group(1)
 
 def extract_hed_links(page_html):
-    pattern = r'(?:https://www\.higheredjobs\.com)?/faculty/details\.cfm\?JobCode=\d+[^"\'<>\s]*'
+    # Links are absolute in view-source saves, but relative to /faculty/ in pages saved from the DOM
+    pattern = r'(?<![\w/])(?:(?:https://www\.higheredjobs\.com)?/faculty/)?details\.cfm\?JobCode=\d+[^"\'<>\s]*'
     homepage = "https://www.higheredjobs.com"
-    return extract_posting_links(page_html, pattern, homepage)
+    links = extract_posting_links(page_html, pattern, homepage)
+    return [link if link.startswith("http") else f"{homepage}/faculty/{link}" for link in links]
+
+def _hed_job_id(link):
+    return re.search(r'JobCode=(\d+)', link, flags=re.IGNORECASE).group(1)
 
 def extract_ejm_links(page_html):
     # Absolute only: a relative /positions/N would also match other sites' URLs quoted in ad text
@@ -178,6 +189,11 @@ class HEdJobsExtractor(JobExtractor):
         self.link_extractor = extract_hed_links
         super().__init__(zipfile, output_zip)
 
+    def _extract_links(self):
+        # Match on job ID: the title in the URL can change between saves of the listing
+        known_ids = {_hed_job_id(link) for link in self.existing_links}
+        return [link for link in super()._extract_links() if _hed_job_id(link) not in known_ids]
+
 
 class CVJobsExtractor(JobExtractor):
     def __init__(self, zipfile=None, output_zip=None):
@@ -187,6 +203,11 @@ class CVJobsExtractor(JobExtractor):
         self.homepage = "https://jobs.chronicle.com/"
         self.link_extractor = extract_cv_links
         super().__init__(zipfile, output_zip)
+
+    def _extract_links(self):
+        # Match on job ID: older link-file lines carry ?LinkSource=TopJob, and a retitled job gets a new slug
+        known_ids = {_cv_job_id(link) for link in self.existing_links}
+        return [link for link in super()._extract_links() if _cv_job_id(link) not in known_ids]
 
 
 class EJMJobsExtractor(JobExtractor):
