@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import datetime as dt
 import glob
+import ast
 import os
 import re
 
@@ -47,6 +48,21 @@ DATE_COLUMNS = ["date_posted", "review_start", "deadline"]
 # Read-only columns computed by rankings.py from each posting's university; not saved to the CSV
 RANK_COLS = ["rank_flag", "rank_reason", "carnegie", "qs_rank", "times_rank", "matched_name", "match_score"]
 DATE_PRESETS = ["Any", "Today onward", "Next 7 days", "Next 30 days", "Past 7 days", "Past 30 days", "Custom range"]
+# Display-only checkbox column in the editor; toggling it opens the row's details popup
+DETAILS_COL = "🔍"
+# Fields shown in the popup's header rather than in its field list
+HEADER_FIELDS = ["job_title", "university", "location", "link", "status"]
+# Triage codes (see merge.py) offered by the popup's status picker
+STATUS_LABELS = {
+    "...": "… unseen",
+    "n": "n · no",
+    "m": "m · maybe",
+    "y": "y · yes",
+    "1": "1 · priority",
+    "d": "d · applied",
+}
+# Text longer than this gets its own section in the popup instead of a key/value line
+LONG_TEXT = 80
 
 # 2. Data Loading Function
 @st.cache_data
@@ -98,6 +114,90 @@ def preset_range(preset: str):
     }[preset]
 
 
+def as_list(value):
+    """Return the items of a stringified Python list (e.g. "['CV', 'cover letter']"), else None."""
+    if isinstance(value, str) and value.startswith("[") and value.endswith("]"):
+        try:
+            items = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return None
+        if isinstance(items, list):
+            return [str(i) for i in items]
+    return None
+
+
+def is_blank(value) -> bool:
+    return value is None or (not isinstance(value, (list, tuple)) and pd.isna(value)) or str(value).strip() == ""
+
+
+def close_details():
+    st.session_state.pop("details_row", None)
+
+
+def status_picker(row_id, current):
+    """Status buttons in the popup. A pick is written to the master dataframe and the table is
+    rebuilt to show it; the popup reopens on the rerun because `details_row` is still set."""
+    current = "" if is_blank(current) else str(current).strip()
+    st.markdown("**status**")
+    picked = st.segmented_control(
+        "status",
+        options=list(STATUS_LABELS),
+        format_func=STATUS_LABELS.get,
+        default=current if current in STATUS_LABELS else None,
+        label_visibility="collapsed",
+        key=f"details_status_{row_id}",
+    )
+    if current and current not in STATUS_LABELS:
+        st.caption(f"Current value `{current}` (e.g. a merge conflict); pick one to resolve it.")
+    if picked is not None and picked != current:
+        st.session_state.df.at[row_id, "status"] = picked
+        invalidate_view()
+        st.rerun()
+
+
+@st.dialog("Posting details", width="large", on_dismiss=close_details)
+def show_details(row_id):
+    row = st.session_state.df.loc[row_id]
+    title = row.get("job_title")
+    st.markdown(f"### {title if not is_blank(title) else '(untitled)'}")
+    where = " · ".join(str(row[c]) for c in ["university", "location"] if c in row and not is_blank(row[c]))
+    if where:
+        st.markdown(f"**{where}**")
+    link = row.get("link")
+    if not is_blank(link) and str(link).startswith("http"):
+        st.link_button("Open application link ↗", str(link))
+    if "status" in row.index:
+        status_picker(row_id, row["status"])
+
+    short, long = [], []
+    for col, value in row.items():
+        if col in HEADER_FIELDS or is_blank(value):
+            continue
+        items = as_list(value)
+        if items is not None or len(str(value)) > LONG_TEXT:
+            long.append((col, items, value))
+        else:
+            short.append((col, value))
+
+    if short:
+        st.markdown("---")
+        grid = st.columns(2)
+        for i, (col, value) in enumerate(short):
+            grid[i % 2].markdown(f"**{col}**: {value}")
+
+    for col, items, value in long:
+        st.markdown("---")
+        st.markdown(f"**{col}**")
+        if items is not None:
+            st.markdown("\n".join(f"- {item}" for item in items) or "_(empty)_")
+        elif col == "text":
+            # The posting itself (markdown from parse.py); scroll it inside the popup
+            with st.container(height=400):
+                st.markdown(str(value))
+        else:
+            st.markdown(str(value))
+
+
 def invalidate_view():
     # Forces the editor to be rebuilt from the master dataframe on the next run,
     # and stops the old editor's edits from being re-applied on top of newer changes
@@ -135,6 +235,7 @@ if file_changed or refresh_clicked or ("df" not in st.session_state):
     st.session_state.df = add_rank_info(loaded_data) if loaded_data is not None else None
     st.session_state.current_file = selected_file
     st.session_state.pop("filter_sig", None)
+    close_details()
     invalidate_view()
 elif "view_base" in st.session_state:
     # Sync edits from the editor's widget state back to the master dataframe before filtering,
@@ -144,7 +245,8 @@ elif "view_base" in st.session_state:
     for row_pos, changes in edits.items():
         row_id = st.session_state.view_base.index[int(row_pos)]
         for col, value in changes.items():
-            st.session_state.df.at[row_id, col] = value
+            if col != DETAILS_COL:
+                st.session_state.df.at[row_id, col] = value
 
 st.title("Interactive Data Editor & Persistor")
 st.caption(f"Active file: `{selected_file}`")
@@ -338,18 +440,44 @@ if n_stale or n_new:
 else:
     col_info.caption(
         f"Showing {len(view_base)} of {len(master_df)} rows. 💡 Double-click cells to edit; "
+        f"click {DETAILS_COL} to see a row in full; "
         f"rows stay in view until you change a filter or click Re-apply Filters."
     )
 
-# The editor's input stays the same between edits; the edits themselves live in its widget state
+# The editor's input stays the same between edits; the edits themselves live in its widget state.
+# A details checkbox column is prepended for display only; it is never written to the master dataframe.
 editor_key = f"editor_{selected_file}_{st.session_state.editor_version}"
+editor_input = view_base.copy()
+editor_input.insert(0, DETAILS_COL, False)
 edited_df = st.data_editor(
-    view_base,
+    editor_input,
     width="stretch",
     height=550,
     disabled=[c for c in RANK_COLS if c in view_base.columns],
+    column_config={
+        DETAILS_COL: st.column_config.CheckboxColumn(DETAILS_COL, help="Click to open this row's details", width="small"),
+    },
     key=editor_key
 )
+
+# Open the popup for whichever row's details box changed since the last run. Checking or
+# unchecking both count, so every click opens it without rebuilding the editor (keeps scroll).
+ticks = {
+    int(pos): changes[DETAILS_COL]
+    for pos, changes in st.session_state.get(editor_key, {}).get("edited_rows", {}).items()
+    if DETAILS_COL in changes
+}
+prev_key, prev_ticks = st.session_state.get("details_ticks", (None, {}))
+if prev_key != editor_key:
+    prev_ticks = {}
+changed = [pos for pos, value in ticks.items() if prev_ticks.get(pos, False) != value]
+changed += [pos for pos, value in prev_ticks.items() if pos not in ticks and value]
+st.session_state.details_ticks = (editor_key, ticks)
+if changed:
+    st.session_state.details_row = view_base.index[changed[0]]
+# Stays open across reruns (e.g. after a status pick) until dismissed
+if st.session_state.get("details_row") in master_df.index:
+    show_details(st.session_state.details_row)
 
 # 7. Bulk Operations Toolbar (Dynamic Column Options)
 st.markdown("---")
