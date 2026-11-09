@@ -16,9 +16,13 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Available Files Configuration: every data/*jobs.csv is offered (rescanned on each rerun),
-# so a new site's CSV shows up without code changes. Known sites get a display name and come first.
-DATASET_PATTERN = "data/*jobs.csv"
+# Available Files Configuration: every CSV in the chosen folder is offered (rescanned on each rerun),
+# except rankings.py's reference tables. Known job files get a display name and come first.
+DEFAULT_DATA_DIR = "data"
+REFERENCE_FILES = {
+    os.path.basename(p)
+    for p in [rankings.CARNEGIE_CSV, rankings.CARNEGIE_LABELS_CSV, rankings.QS_CSV, rankings.TIMES_CSV]
+}
 DATASET_NAMES = {
     "alljobs.csv": "All sites, merged",
     "hedjobs.csv": "HigherEdJobs",
@@ -29,8 +33,8 @@ DATASET_NAMES = {
 }
 
 
-def find_datasets():
-    paths = glob.glob(DATASET_PATTERN)
+def find_datasets(folder: str):
+    paths = [p for p in glob.glob(os.path.join(folder, "*.csv")) if os.path.basename(p) not in REFERENCE_FILES]
     order = list(DATASET_NAMES)
     paths.sort(key=lambda p: (order.index(os.path.basename(p)) if os.path.basename(p) in order else len(order), p))
     options = {}
@@ -41,18 +45,22 @@ def find_datasets():
     return options
 
 
-DATASET_OPTIONS = find_datasets()
-
-# Columns that get date-range filters instead of text filters (when present)
+# Columns that always get date-range filters when present (job CSVs mix dates with free text
+# like "ongoing"); any other column whose values are mostly ISO dates is detected as well
 DATE_COLUMNS = ["date_posted", "review_start", "deadline"]
+DATE_SHARE = 0.5
 # Read-only columns computed by rankings.py from each posting's university; not saved to the CSV
 RANK_COLS = ["rank_flag", "rank_reason", "carnegie", "qs_rank", "times_rank", "matched_name", "match_score"]
 DATE_PRESETS = ["Any", "Today onward", "Next 7 days", "Next 30 days", "Past 7 days", "Past 30 days", "Custom range"]
 # Display-only checkbox column in the editor; toggling it opens the row's details popup
 DETAILS_COL = "🔍"
-# Fields shown in the popup's header rather than in its field list
-HEADER_FIELDS = ["job_title", "university", "location", "link", "status"]
-# Triage codes (see merge.py) offered by the popup's status picker
+# Fields shown in the popup's header rather than in its field list (when present)
+HEADER_FIELDS = ["job_title", "university", "location", "link"]
+# Columns a popup heading may come from, best first; otherwise the row's first short text value
+TITLE_FIELDS = ["job_title", "title", "name"]
+# A `status` column gets a picker in the popup: these triage codes (see merge.py) when its values
+# are all codes or `|`-joined codes, else its own distinct values if there are at most this many
+MAX_PICKER_OPTIONS = 12
 STATUS_LABELS = {
     "...": "… unseen",
     "n": "n · no",
@@ -69,7 +77,8 @@ LONG_TEXT = 80
 def load_data(file_path: str):
     if os.path.exists(file_path):
         try:
-            return pd.read_csv(file_path, dtype={"id": str})
+            # status as str keeps the triage code "1" from becoming 1.0
+            return pd.read_csv(file_path, dtype={"id": str, "status": str})
         except Exception as err:
             st.error(f"Error parsing `{file_path}`: {err}")
             return None
@@ -95,6 +104,19 @@ def add_rank_info(df: pd.DataFrame) -> pd.DataFrame:
     for offset, col in enumerate(RANK_COLS):
         df.insert(pos + offset, col, info[col])
     return df
+
+
+def find_date_columns(df: pd.DataFrame) -> list:
+    """DATE_COLUMNS that are present, plus text columns whose non-blank values are mostly ISO dates."""
+    found = [c for c in DATE_COLUMNS if c in df.columns]
+    for col in df.columns:
+        if col in found or col in RANK_COLS or pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        values = df[col].dropna().astype(str).str.strip()
+        values = values[values != ""]
+        if len(values) and values.str.match(r"\d{4}-\d{2}-\d{2}").mean() >= DATE_SHARE:
+            found.append(col)
+    return found
 
 
 def parse_dates(series: pd.Series) -> pd.Series:
@@ -134,20 +156,30 @@ def close_details():
     st.session_state.pop("details_row", None)
 
 
-def status_picker(row_id, current):
+def status_options(column: pd.Series):
+    """(options, labels) for the popup's status picker, or None if the column has no small value set."""
+    values = [str(v).strip() for v in column.dropna().unique() if str(v).strip()]
+    if all(part in STATUS_LABELS for v in values for part in v.split("|")):
+        return list(STATUS_LABELS), STATUS_LABELS
+    if 0 < len(values) <= MAX_PICKER_OPTIONS:
+        return sorted(values), {}
+    return None
+
+
+def status_picker(row_id, current, options, labels):
     """Status buttons in the popup. A pick is written to the master dataframe and the table is
     rebuilt to show it; the popup reopens on the rerun because `details_row` is still set."""
     current = "" if is_blank(current) else str(current).strip()
     st.markdown("**status**")
     picked = st.segmented_control(
         "status",
-        options=list(STATUS_LABELS),
-        format_func=STATUS_LABELS.get,
-        default=current if current in STATUS_LABELS else None,
+        options=options,
+        format_func=lambda v: labels.get(v, v),
+        default=current if current in options else None,
         label_visibility="collapsed",
         key=f"details_status_{row_id}",
     )
-    if current and current not in STATUS_LABELS:
+    if current and current not in options:
         st.caption(f"Current value `{current}` (e.g. a merge conflict); pick one to resolve it.")
     if picked is not None and picked != current:
         st.session_state.df.at[row_id, "status"] = picked
@@ -155,23 +187,40 @@ def status_picker(row_id, current):
         st.rerun()
 
 
-@st.dialog("Posting details", width="large", on_dismiss=close_details)
+def title_field(row: pd.Series):
+    """Column to use as the popup heading: a TITLE_FIELDS column, else the first short text value."""
+    for col in TITLE_FIELDS:
+        if col in row.index and not is_blank(row[col]):
+            return col
+    for col, value in row.items():
+        if col in RANK_COLS or is_blank(value) or not isinstance(value, str):
+            continue
+        if len(value) <= LONG_TEXT and as_list(value) is None:
+            return col
+    return None
+
+
+@st.dialog("Details", width="large", on_dismiss=close_details)
 def show_details(row_id):
-    row = st.session_state.df.loc[row_id]
-    title = row.get("job_title")
-    st.markdown(f"### {title if not is_blank(title) else '(untitled)'}")
+    df = st.session_state.df
+    row = df.loc[row_id]
+    heading = title_field(row)
+    st.markdown(f"### {row[heading] if heading else '(untitled)'}")
     where = " · ".join(str(row[c]) for c in ["university", "location"] if c in row and not is_blank(row[c]))
     if where:
         st.markdown(f"**{where}**")
     link = row.get("link")
     if not is_blank(link) and str(link).startswith("http"):
         st.link_button("Open application link ↗", str(link))
-    if "status" in row.index:
-        status_picker(row_id, row["status"])
+    skip = set(HEADER_FIELDS) | {heading}
+    picker = status_options(df["status"]) if "status" in df.columns else None
+    if picker:
+        status_picker(row_id, row["status"], *picker)
+        skip.add("status")
 
     short, long = [], []
     for col, value in row.items():
-        if col in HEADER_FIELDS or is_blank(value):
+        if col in skip or is_blank(value):
             continue
         items = as_list(value)
         if items is not None or len(str(value)) > LONG_TEXT:
@@ -207,8 +256,16 @@ def invalidate_view():
 # 3. Sidebar: Dataset Selection & Refresh Controls
 st.sidebar.header("📁 Dataset Selection")
 
+data_dir = st.sidebar.text_input(
+    "Data folder",
+    DEFAULT_DATA_DIR,
+    key="data_dir",
+    help="Every CSV in this folder is listed below. Relative paths are from where you ran streamlit.",
+).strip() or DEFAULT_DATA_DIR
+DATASET_OPTIONS = find_datasets(os.path.expanduser(data_dir))
+
 if not DATASET_OPTIONS:
-    st.warning(f"⚠️ No datasets found matching `{DATASET_PATTERN}`.")
+    st.warning(f"⚠️ No CSV files found in `{data_dir}`.")
     st.stop()
 
 # Keyed so the current choice survives a new CSV appearing in the list
@@ -301,7 +358,7 @@ if global_search:
         st.sidebar.error(f"Invalid Regex: {e}")
 
 # Date filters: presets for quick ranges, or a custom range
-date_cols = [c for c in DATE_COLUMNS if c in master_df.columns]
+date_cols = find_date_columns(master_df)
 if date_cols:
     st.sidebar.markdown("---")
     st.sidebar.subheader("📅 Date Filters")
