@@ -57,7 +57,7 @@ DETAILS_COL = "🔍"
 # Fields shown in the popup's header rather than in its field list (when present)
 HEADER_FIELDS = ["job_title", "university", "location", "link"]
 # Columns a popup heading may come from, best first; otherwise the row's first short text value
-TITLE_FIELDS = ["job_title", "title", "name"]
+TITLE_FIELDS = ["job_title", "position", "title", "name"]
 # A `status` column gets a picker in the popup: these triage codes (see merge.py) when its values
 # are all codes or `|`-joined codes, else its own distinct values if there are at most this many
 MAX_PICKER_OPTIONS = 12
@@ -426,10 +426,12 @@ for col in master_df.columns:
                     key=f"{widget_key_prefix}_slider"
                 )
                 filter_state.append(selected_range)
-                filtered_df = filtered_df[
-                    (filtered_df[col] >= selected_range[0]) &
-                    (filtered_df[col] <= selected_range[1])
-                ]
+                # Untouched slider = no filter, so rows with a blank in this column aren't dropped
+                if selected_range != (min_val, max_val):
+                    filtered_df = filtered_df[
+                        (filtered_df[col] >= selected_range[0]) &
+                        (filtered_df[col] <= selected_range[1])
+                    ]
 
     # Categorical / Text column filter
     else:
