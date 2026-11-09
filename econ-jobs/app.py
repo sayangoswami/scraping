@@ -52,8 +52,6 @@ DATE_SHARE = 0.5
 # Read-only columns computed by rankings.py from each posting's university; not saved to the CSV
 RANK_COLS = ["rank_flag", "rank_reason", "carnegie", "qs_rank", "times_rank", "matched_name", "match_score"]
 DATE_PRESETS = ["Any", "Today onward", "Next 7 days", "Next 30 days", "Past 7 days", "Past 30 days", "Custom range"]
-# Display-only checkbox column in the editor; toggling it opens the row's details popup
-DETAILS_COL = "🔍"
 # Fields shown in the popup's header rather than in its field list (when present)
 HEADER_FIELDS = ["job_title", "university", "location", "link"]
 # Columns a popup heading may come from, best first; otherwise the row's first short text value
@@ -154,6 +152,7 @@ def is_blank(value) -> bool:
 
 def close_details():
     st.session_state.pop("details_row", None)
+    st.session_state.pop("details_edit", None)
 
 
 def status_options(column: pd.Series):
@@ -200,12 +199,82 @@ def title_field(row: pd.Series):
     return None
 
 
+def set_details_edit(on: bool):
+    st.session_state.details_edit = on
+
+
+def set_value(df: pd.DataFrame, row_id, col, value):
+    """Write one edited value, widening an int column to float when it gets a blank."""
+    if value is None and pd.api.types.is_integer_dtype(df[col]):
+        df[col] = df[col].astype("float64")
+    df.at[row_id, col] = value
+
+
+def edit_form(row_id):
+    """Form with one field per column (rank columns are computed, so left out). Save writes the
+    changed fields to the master dataframe and rebuilds the table; the popup stays open."""
+    df = st.session_state.df
+    row = df.loc[row_id]
+    picker = status_options(df["status"]) if "status" in df.columns else None
+    inputs = {}
+    with st.form(f"edit_{row_id}", border=False):
+        for col in df.columns:
+            if col in RANK_COLS:
+                continue
+            value, key = row[col], f"edit_{row_id}_{col}"
+            if col == "status" and picker:
+                options, labels = picker
+                current = "" if is_blank(value) else str(value).strip()
+                inputs[col] = st.segmented_control(
+                    col, options, format_func=lambda v: labels.get(v, v),
+                    default=current if current in options else None, key=key,
+                )
+            elif pd.api.types.is_bool_dtype(df[col]):
+                inputs[col] = st.checkbox(col, value=bool(value), key=key)
+            elif pd.api.types.is_numeric_dtype(df[col]):
+                integer = pd.api.types.is_integer_dtype(df[col])
+                start = None if pd.isna(value) else (int(value) if integer else float(value))
+                inputs[col] = st.number_input(col, value=start, step=1 if integer else None, key=key)
+            else:
+                text = "" if is_blank(value) else str(value)
+                longest = df[col].dropna().astype(str).str.len().max()
+                if (longest or 0) > LONG_TEXT or "\n" in text:
+                    height = 300 if col == "text" else 120
+                    inputs[col] = st.text_area(col, text, height=height, key=key)
+                else:
+                    inputs[col] = st.text_input(col, text, key=key)
+        col_save, col_cancel = st.columns(2)
+        save = col_save.form_submit_button("💾 Save", type="primary", use_container_width=True)
+        col_cancel.form_submit_button("Cancel", use_container_width=True, on_click=set_details_edit, args=(False,))
+
+    if save:
+        for col, new in inputs.items():
+            old = row[col]
+            if isinstance(new, str):
+                if (is_blank(old) and new.strip() == "") or (not is_blank(old) and str(old) == new):
+                    continue
+                new = new if new.strip() else None
+            elif new is None and is_blank(old):
+                continue
+            elif new is not None and not is_blank(old) and new == old:
+                continue
+            set_value(df, row_id, col, new)
+        st.session_state.pop("details_edit", None)
+        invalidate_view()
+        st.rerun()
+
+
 @st.dialog("Details", width="large", on_dismiss=close_details)
 def show_details(row_id):
+    if st.session_state.get("details_edit"):
+        edit_form(row_id)
+        return
     df = st.session_state.df
     row = df.loc[row_id]
     heading = title_field(row)
-    st.markdown(f"### {row[heading] if heading else '(untitled)'}")
+    col_head, col_edit = st.columns([5, 1], vertical_alignment="center")
+    col_head.markdown(f"### {row[heading] if heading else '(untitled)'}")
+    col_edit.button("✏️ Edit", use_container_width=True, on_click=set_details_edit, args=(True,))
     where = " · ".join(str(row[c]) for c in ["university", "location"] if c in row and not is_blank(row[c]))
     if where:
         st.markdown(f"**{where}**")
@@ -302,8 +371,7 @@ elif "view_base" in st.session_state:
     for row_pos, changes in edits.items():
         row_id = st.session_state.view_base.index[int(row_pos)]
         for col, value in changes.items():
-            if col != DETAILS_COL:
-                st.session_state.df.at[row_id, col] = value
+            st.session_state.df.at[row_id, col] = value
 
 st.title("Interactive Data Editor & Persistor")
 st.caption(f"Active file: `{selected_file}`")
@@ -474,8 +542,18 @@ st.subheader("Edit Your Data Below")
 # The view (which rows are shown) is frozen until the filters change, so editing a value
 # that a filter depends on (e.g. status) doesn't make the row vanish or reset the table.
 filter_sig = repr((selected_file, filter_state))
-col_info, col_reapply = st.columns([4, 1])
+col_info, col_mode, col_reapply = st.columns([4, 1, 1], vertical_alignment="center")
+grid_edit = col_mode.toggle(
+    "✏️ Grid edit",
+    key="grid_edit",
+    help="Off: click any cell to open that row's details. On: edit cells directly in the table.",
+)
 reapply_clicked = col_reapply.button("🔁 Re-apply Filters", use_container_width=True)
+
+# Switching modes rebuilds the table from the master dataframe (which already has the grid's edits)
+if st.session_state.get("view_mode") != grid_edit:
+    st.session_state.view_mode = grid_edit
+    invalidate_view()
 
 if st.session_state.get("filter_sig") != filter_sig or reapply_clicked:
     st.session_state.filter_sig = filter_sig
@@ -498,43 +576,43 @@ if n_stale or n_new:
     )
 else:
     col_info.caption(
-        f"Showing {len(view_base)} of {len(master_df)} rows. 💡 Double-click cells to edit; "
-        f"click {DETAILS_COL} to see a row in full; "
-        f"rows stay in view until you change a filter or click Re-apply Filters."
+        f"Showing {len(view_base)} of {len(master_df)} rows. 💡 "
+        + ("Double-click cells to edit; " if grid_edit else "Click any cell to open its row; ")
+        + "rows stay in view until you change a filter or click Re-apply Filters."
     )
 
-# The editor's input stays the same between edits; the edits themselves live in its widget state.
-# A details checkbox column is prepended for display only; it is never written to the master dataframe.
-editor_key = f"editor_{selected_file}_{st.session_state.editor_version}"
-editor_input = view_base.copy()
-editor_input.insert(0, DETAILS_COL, False)
-edited_df = st.data_editor(
-    editor_input,
-    width="stretch",
-    height=550,
-    disabled=[c for c in RANK_COLS if c in view_base.columns],
-    column_config={
-        DETAILS_COL: st.column_config.CheckboxColumn(DETAILS_COL, help="Click to open this row's details", width="small"),
-    },
-    key=editor_key
-)
+table_key = f"table_{selected_file}_{st.session_state.editor_version}"
+if grid_edit:
+    # The editor's input stays the same between edits; the edits themselves live in its widget
+    # state and are synced into the master dataframe at the top of each run.
+    editor_key = f"editor_{selected_file}_{st.session_state.editor_version}"
+    st.data_editor(
+        view_base,
+        width="stretch",
+        height=550,
+        disabled=[c for c in RANK_COLS if c in view_base.columns],
+        key=editor_key
+    )
+else:
+    event = st.dataframe(
+        view_base,
+        width="stretch",
+        height=550,
+        on_select="rerun",
+        selection_mode="single-cell",
+        key=table_key,
+    )
+    # Open the popup when the selection changes. Clicking the selected cell again deselects it,
+    # which counts as a click on that row too, so the table never needs resetting (keeps scroll).
+    cells = [tuple(c) for c in event.selection.get("cells", [])]
+    prev_key, prev_cells = st.session_state.get("table_cells", (None, []))
+    if prev_key != table_key:
+        prev_cells = []
+    st.session_state.table_cells = (table_key, cells)
+    if cells != prev_cells and (cells or prev_cells):
+        st.session_state.details_row = view_base.index[(cells or prev_cells)[0][0]]
 
-# Open the popup for whichever row's details box changed since the last run. Checking or
-# unchecking both count, so every click opens it without rebuilding the editor (keeps scroll).
-ticks = {
-    int(pos): changes[DETAILS_COL]
-    for pos, changes in st.session_state.get(editor_key, {}).get("edited_rows", {}).items()
-    if DETAILS_COL in changes
-}
-prev_key, prev_ticks = st.session_state.get("details_ticks", (None, {}))
-if prev_key != editor_key:
-    prev_ticks = {}
-changed = [pos for pos, value in ticks.items() if prev_ticks.get(pos, False) != value]
-changed += [pos for pos, value in prev_ticks.items() if pos not in ticks and value]
-st.session_state.details_ticks = (editor_key, ticks)
-if changed:
-    st.session_state.details_row = view_base.index[changed[0]]
-# Stays open across reruns (e.g. after a status pick) until dismissed
+# Stays open across reruns (e.g. after a status pick or a save) until dismissed
 if st.session_state.get("details_row") in master_df.index:
     show_details(st.session_state.details_row)
 
