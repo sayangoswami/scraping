@@ -59,6 +59,9 @@ TITLE_FIELDS = ["job_title", "position", "title", "name"]
 # A `status` column gets a picker in the popup: these triage codes (see merge.py) when its values
 # are all codes or `|`-joined codes, else its own distinct values if there are at most this many
 MAX_PICKER_OPTIONS = 12
+# A text column with at most this many distinct values (some repeated) gets a dropdown in the
+# sidebar filters and in the popup's edit form
+MAX_ENUM_OPTIONS = 20
 STATUS_LABELS = {
     "...": "… unseen",
     "n": "n · no",
@@ -76,10 +79,18 @@ def load_data(file_path: str):
     if os.path.exists(file_path):
         try:
             # status as str keeps the triage code "1" from becoming 1.0
-            return pd.read_csv(file_path, dtype={"id": str, "status": str})
+            df = pd.read_csv(file_path, dtype={"id": str, "status": str})
         except Exception as err:
             st.error(f"Error parsing `{file_path}`: {err}")
             return None
+        # Whole-number columns with blanks load as floats and would be saved back as "1.0";
+        # the nullable Int64 type keeps them whole
+        for col in df.columns:
+            if pd.api.types.is_float_dtype(df[col]):
+                values = df[col].dropna()
+                if len(values) and (values == values.round()).all():
+                    df[col] = df[col].astype("Int64")
+        return df
     return None
 
 
@@ -199,14 +210,24 @@ def title_field(row: pd.Series):
     return None
 
 
+def enum_values(column: pd.Series):
+    """Sorted distinct values of a column that looks like a fixed set of choices, else None."""
+    values = column.dropna().astype(str).str.strip()
+    values = values[values != ""]
+    distinct = sorted(values.unique())
+    if 0 < len(distinct) <= MAX_ENUM_OPTIONS and len(distinct) < len(values):
+        return distinct
+    return None
+
+
 def set_details_edit(on: bool):
     st.session_state.details_edit = on
 
 
 def set_value(df: pd.DataFrame, row_id, col, value):
-    """Write one edited value, widening an int column to float when it gets a blank."""
-    if value is None and pd.api.types.is_integer_dtype(df[col]):
-        df[col] = df[col].astype("float64")
+    """Write one edited value, making a plain int column nullable (Int64) when it gets a blank."""
+    if value is None and df[col].dtype == "int64":
+        df[col] = df[col].astype("Int64")
     df.at[row_id, col] = value
 
 
@@ -216,7 +237,9 @@ def edit_form(row_id):
     df = st.session_state.df
     row = df.loc[row_id]
     picker = status_options(df["status"]) if "status" in df.columns else None
+    date_cols = find_date_columns(df)
     inputs = {}
+    numbers = {}  # numeric column -> whether it holds whole numbers
     with st.form(f"edit_{row_id}", border=False):
         for col in df.columns:
             if col in RANK_COLS:
@@ -232,9 +255,19 @@ def edit_form(row_id):
             elif pd.api.types.is_bool_dtype(df[col]):
                 inputs[col] = st.checkbox(col, value=bool(value), key=key)
             elif pd.api.types.is_numeric_dtype(df[col]):
-                integer = pd.api.types.is_integer_dtype(df[col])
-                start = None if pd.isna(value) else (int(value) if integer else float(value))
-                inputs[col] = st.number_input(col, value=start, step=1 if integer else None, key=key)
+                # A text box rather than st.number_input, which can't be cleared back to blank
+                numbers[col] = pd.api.types.is_integer_dtype(df[col])
+                inputs[col] = st.text_input(
+                    col, "" if pd.isna(value) else str(value), placeholder="(blank) — number", key=key,
+                )
+            elif (choices := enum_values(df[col])) and col not in date_cols:
+                current = "" if is_blank(value) else str(value).strip()
+                if current and current not in choices:
+                    choices = sorted(choices + [current])
+                inputs[col] = st.selectbox(
+                    col, choices, index=choices.index(current) if current else None,
+                    accept_new_options=True, placeholder="(blank) — pick or type a value", key=key,
+                )
             else:
                 text = "" if is_blank(value) else str(value)
                 longest = df[col].dropna().astype(str).str.len().max()
@@ -248,6 +281,16 @@ def edit_form(row_id):
         col_cancel.form_submit_button("Cancel", use_container_width=True, on_click=set_details_edit, args=(False,))
 
     if save:
+        bad = []
+        for col, integer in numbers.items():
+            text = inputs[col].strip()
+            try:
+                inputs[col] = None if text == "" else (int(text) if integer else float(text))
+            except ValueError:
+                bad.append(col)
+        if bad:
+            st.error(f"Not a valid number in: {', '.join(bad)}. Nothing was saved.")
+            return
         for col, new in inputs.items():
             old = row[col]
             if isinstance(new, str):
@@ -504,7 +547,7 @@ for col in master_df.columns:
     # Categorical / Text column filter
     else:
         unique_vals = sorted(master_df[col].dropna().unique())
-        if 0 < len(unique_vals) <= 20:
+        if 0 < len(unique_vals) <= MAX_ENUM_OPTIONS:
             # Keep current selections as options even if edits removed their last row
             ms_key = f"{widget_key_prefix}_multiselect"
             unique_vals = sorted(set(unique_vals) | set(st.session_state.get(ms_key, [])))
@@ -581,7 +624,9 @@ else:
         + "rows stay in view until you change a filter or click Re-apply Filters."
     )
 
-table_key = f"table_{selected_file}_{st.session_state.editor_version}"
+# Fixed per file: a keyed st.dataframe keeps its identity when its data changes, so a sort set by
+# clicking a header survives saves and status picks (a new key would reset it)
+table_key = f"table_{selected_file}"
 if grid_edit:
     # The editor's input stays the same between edits; the edits themselves live in its widget
     # state and are synced into the master dataframe at the top of each run.
@@ -610,7 +655,10 @@ else:
         prev_cells = []
     st.session_state.table_cells = (table_key, cells)
     if cells != prev_cells and (cells or prev_cells):
-        st.session_state.details_row = view_base.index[(cells or prev_cells)[0][0]]
+        pos = (cells or prev_cells)[0][0]
+        # A selection left over from before a filter change can point past the current rows
+        if pos < len(view_base):
+            st.session_state.details_row = view_base.index[pos]
 
 # Stays open across reruns (e.g. after a status pick or a save) until dismissed
 if st.session_state.get("details_row") in master_df.index:
