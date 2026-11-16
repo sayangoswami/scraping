@@ -32,7 +32,7 @@ from zipfile import ZipFile, ZIP_DEFLATED
 
 from camoufox import AsyncCamoufox
 
-from scrape import extract_cv_links, extract_ejm_links, extract_joe_links
+from scrape import extract_cv_links, extract_ejm_links, extract_hed_links, extract_joe_links
 
 
 class ListingDownloader:
@@ -147,6 +147,15 @@ class CVListingDownloader(ListingDownloader):
     link_extractor = extract_cv_links
 
 
+class HEDJListingDownloader(ListingDownloader):
+    site = "hedj"
+    homepage = "https://www.higheredjobs.com/faculty"
+    listing_url = "https://www.higheredjobs.com/faculty/search.cfm?JobCat=81&CatName=Economics&NumJobs=100&Page={}"
+    num_pages = 6
+    file_name = "hredjobs-p{}.html"   # HEdJobsExtractor reads data/hedj/hredjobs-p*.html
+    link_extractor = extract_hed_links
+
+
 def joe_issue(today=None):
     """JOE issue covering a date: YYYY-01 runs February-July, YYYY-02 runs August-January."""
     today = today or dt.date.today()
@@ -181,7 +190,7 @@ class JOEListingDownloader(ListingDownloader):
         return f"https://www.aeaweb.org/joe/listings?q={q}"
 
 
-SITES = {cls.site: cls for cls in [EJMListingDownloader, CVListingDownloader, JOEListingDownloader]}
+SITES = {cls.site: cls for cls in [EJMListingDownloader, CVListingDownloader, HEDJListingDownloader, JOEListingDownloader]}
 
 
 async def main():
