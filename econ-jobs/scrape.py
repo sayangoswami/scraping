@@ -70,8 +70,10 @@ def extract_ejm_links(page_html):
     return extract_posting_links(page_html, pattern, homepage)
 
 def extract_joe_links(page_html):
-    # Drop the per-session q= parameter; JOE_ID alone resolves to the listing
-    pattern = r'https://www\.aeaweb\.org/joe/listing\.php\?JOE_ID=[\d_-]+'
+    # Drop the per-session q= parameter; JOE_ID alone resolves to the listing.
+    # Links are absolute in view-source saves but relative in pages saved from the DOM;
+    # the lookbehind stops a relative match inside another site's URL.
+    pattern = r'(?<![\w.])(?:https://www\.aeaweb\.org)?/joe/listing\.php\?JOE_ID=[\d_-]+'
     homepage = "https://www.aeaweb.org"
     return extract_posting_links(page_html, pattern, homepage)
 

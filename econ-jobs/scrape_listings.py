@@ -13,21 +13,26 @@ Usage (from econ-jobs/):
     python scrape_listings.py ejm
     python scrape_listings.py ejm cv --zip --refresh
     python scrape_listings.py ejm --pages 8
+    python scrape_listings.py joe --issue 2026-02
 
 To add a site: subclass ListingDownloader with its key, URLs, page count, file-name pattern
 (matching the extractor's adlist_pattern in scrape.py) and link extractor, then add it to SITES.
 """
 import argparse
 import asyncio
+import base64
+import datetime as dt
+import json
 import os
 import random
 import tempfile
+import zlib
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 
 from camoufox import AsyncCamoufox
 
-from scrape import extract_cv_links, extract_ejm_links
+from scrape import extract_cv_links, extract_ejm_links, extract_joe_links
 
 
 class ListingDownloader:
@@ -37,12 +42,16 @@ class ListingDownloader:
     num_pages = None      # pages 1..num_pages are downloaded (override with --pages)
     file_name = None      # saved page name with {n}; must match the extractor's adlist_pattern
     link_extractor = None # scrape.py function returning the posting links on a listing page
+    timeout_ms = 20000    # page load timeout
 
     def __init__(self, use_zip=False, num_pages=None):
         self.use_zip = use_zip
         self.num_pages = num_pages or self.num_pages
         self.folder = Path("data") / self.site
         self.zip_path = Path("data/postings") / f"{self.site}.zip"
+
+    def page_url(self, n):
+        return self.listing_url.format(n)
 
     def page_name(self, n):
         return self.file_name.format(n)
@@ -95,13 +104,13 @@ class ListingDownloader:
 
         async with AsyncCamoufox(headless=True, humanize=True, os=["macos"]) as browser:
             page = await browser.new_page()
-            await page.goto(self.homepage, wait_until="domcontentloaded", timeout=20000)
+            await page.goto(self.homepage, wait_until="domcontentloaded", timeout=self.timeout_ms)
             await asyncio.sleep(random.randint(3, 5))
 
             for n in pending:
-                url = self.listing_url.format(n)
+                url = self.page_url(n)
                 print(f"[{self.site}] Visiting {url} ...")
-                response = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 if response is not None and not response.ok:
                     raise RuntimeError(f"HTTP {response.status} for {url}")
 
@@ -138,7 +147,41 @@ class CVListingDownloader(ListingDownloader):
     link_extractor = extract_cv_links
 
 
-SITES = {cls.site: cls for cls in [EJMListingDownloader, CVListingDownloader]}
+def joe_issue(today=None):
+    """JOE issue covering a date: YYYY-01 runs February-July, YYYY-02 runs August-January."""
+    today = today or dt.date.today()
+    if today.month >= 8:
+        return f"{today.year}-02"
+    if today.month == 1:
+        return f"{today.year - 1}-02"
+    return f"{today.year}-01"
+
+
+class JOEListingDownloader(ListingDownloader):
+    """All of the current issue's postings on one page (lpp=all)."""
+    site = "joe"
+    homepage = "https://www.aeaweb.org/joe/listings"
+    num_pages = 1
+    file_name = "p{}.html"            # JOEJobsExtractor reads data/joe/p*.html
+    link_extractor = extract_joe_links
+    timeout_ms = 90000                # the all-postings page is several MB
+    issue = None                      # set by --issue; defaults to the current issue
+
+    def page_url(self, n):
+        # The search form is passed as q=: zlib-compressed JSON in URL-safe base64, with "," for "="
+        issue = self.issue or joe_issue()
+        form = {"ListingsForm": {
+            "in_active": "0", "keyword_search": "", "section": None, "jel": None,
+            "issue": issue, "originalIssue": issue, "country_region": None, "saved_folders": None,
+            "candidate_scramble": None, "recent_only": None, "listings_order_by": "date_posted_a",
+            "lpp": "all", "page": None,
+        }}
+        raw = json.dumps(form, separators=(",", ":")).encode()
+        q = base64.urlsafe_b64encode(zlib.compress(raw)).decode().replace("=", ",")
+        return f"https://www.aeaweb.org/joe/listings?q={q}"
+
+
+SITES = {cls.site: cls for cls in [EJMListingDownloader, CVListingDownloader, JOEListingDownloader]}
 
 
 async def main():
@@ -147,10 +190,13 @@ async def main():
     parser.add_argument("--zip", action="store_true", help="save into data/postings/<site>.zip instead of data/<site>/")
     parser.add_argument("--refresh", action="store_true", help="replace previously saved listing pages")
     parser.add_argument("--pages", type=int, help="number of pages to download (default: the site's own)")
+    parser.add_argument("--issue", help="JOE issue, e.g. 2026-02 (default: the current one)")
     args = parser.parse_args()
 
     for site in args.sites:
         downloader = SITES[site](use_zip=args.zip, num_pages=args.pages)
+        if site == "joe" and args.issue:
+            downloader.issue = args.issue
         if args.refresh:
             downloader.clear()
         await downloader.download()
