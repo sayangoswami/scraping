@@ -76,6 +76,11 @@ LONG_TEXT = 80
 # 2. Data Loading Function
 @st.cache_data
 def load_data(file_path: str):
+    return read_csv_file(file_path)
+
+
+def read_csv_file(file_path: str):
+    """Uncached read; load_data caches it. Save uses this to see the file as it is on disk now."""
     if os.path.exists(file_path):
         try:
             # status as str keeps the triage code "1" from becoming 1.0
@@ -359,6 +364,72 @@ def show_details(row_id):
             st.markdown(str(value))
 
 
+def file_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def cell_text(value) -> str:
+    """Comparable text for one cell, so 1, 1.0 and "1" match and every blank is the same."""
+    if is_blank(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def edited_cells(current: pd.DataFrame, original: pd.DataFrame):
+    """[(row_id, col, value)] for every cell the user changed since the file was loaded."""
+    cells = []
+    for col in current.columns.intersection(original.columns):
+        now, then = current[col].map(cell_text), original[col].map(cell_text)
+        for row_id in now.index[now != then]:
+            cells.append((row_id, col, current.at[row_id, col]))
+    return cells
+
+
+def remember_loaded(df):
+    """Record what was read and when, to detect edits on disk by other programs."""
+    st.session_state.df_orig = None if df is None else df.copy()
+    st.session_state.loaded_mtime = file_mtime(st.session_state.current_file)
+
+
+def save_merged(path: str, current: pd.DataFrame):
+    """Write the user's edits without discarding changes another program made to the file.
+
+    If the file is unchanged since it was loaded, the table is written as is. Otherwise the
+    file is re-read and only the cells edited in the app are applied on top of it.
+    Returns (ok, message).
+    """
+    current = current.drop(columns=RANK_COLS, errors="ignore")
+    if file_mtime(path) == st.session_state.get("loaded_mtime"):
+        current.to_csv(path, index=False)
+        return True, f"Changes permanently written to `{path}`!"
+    disk, original = read_csv_file(path), st.session_state.get("df_orig")
+    if disk is None or original is None:
+        return False, f"`{path}` changed on disk and could not be re-read. Nothing was saved."
+    if len(disk) != len(original) or list(disk.index) != list(original.index):
+        return False, (f"`{path}` changed on disk and its rows no longer line up with the loaded "
+                       "copy. Nothing was saved; note your edits, click Refresh Data, and redo them.")
+    cells = edited_cells(current, original)
+    clashes = [(r, c) for r, c, _ in cells
+               if c in disk.columns and cell_text(disk.at[r, c]) != cell_text(original.at[r, c])
+               and cell_text(disk.at[r, c]) != cell_text(current.at[r, c])]
+    for row_id, col, value in cells:
+        if col not in disk.columns:
+            disk[col] = None
+        set_value(disk, row_id, col, None if is_blank(value) else value)
+    disk.to_csv(path, index=False)
+    message = (f"`{path}` had changed on disk; merged your {len(cells)} edited cell(s) into it "
+               "and reloaded.")
+    if clashes:
+        message += " Your value replaced a newer on-disk value in: " + ", ".join(
+            f"row {r} `{c}`" for r, c in clashes[:10]) + ("…" if len(clashes) > 10 else "")
+    return True, message
+
+
 def invalidate_view():
     # Forces the editor to be rebuilt from the master dataframe on the next run,
     # and stops the old editor's edits from being re-applied on top of newer changes
@@ -396,13 +467,31 @@ refresh_clicked = col_refresh.button("🔄 Refresh Data", use_container_width=Tr
 # Reset and reload if switching datasets or user explicitly triggered a refresh
 file_changed = st.session_state.get("current_file") != selected_file
 
-if file_changed or refresh_clicked or ("df" not in st.session_state):
-    if refresh_clicked:
+# Another program (a script, or an editor) may rewrite the CSV while this app holds it in memory.
+# Reload it automatically when there are no unsaved edits; otherwise Save merges (save_merged).
+changed_on_disk = (
+    not file_changed and "df" in st.session_state and st.session_state.df is not None
+    and file_mtime(selected_file) != st.session_state.get("loaded_mtime")
+)
+pending_editor = st.session_state.get(
+    f"editor_{selected_file}_{st.session_state.get('editor_version')}", {}).get("edited_rows")
+has_unsaved = changed_on_disk and (bool(pending_editor) or bool(edited_cells(
+    st.session_state.df.drop(columns=RANK_COLS, errors="ignore"), st.session_state.df_orig)))
+auto_reload = changed_on_disk and not has_unsaved
+if changed_on_disk and has_unsaved:
+    st.sidebar.warning("This file changed on disk after it was loaded. Saving merges your edited "
+                       "cells into the newer file; Refresh Data discards your unsaved edits.")
+
+if file_changed or refresh_clicked or auto_reload or ("df" not in st.session_state):
+    if refresh_clicked or auto_reload:
         st.cache_data.clear()
+    if auto_reload:
+        st.toast("File changed on disk; reloaded.")
 
     loaded_data = load_data(selected_file)
     st.session_state.df = add_rank_info(loaded_data) if loaded_data is not None else None
     st.session_state.current_file = selected_file
+    remember_loaded(loaded_data)
     st.session_state.pop("filter_sig", None)
     close_details()
     invalidate_view()
@@ -742,9 +831,21 @@ col_save, col_dl = st.columns(2)
 
 with col_save:
     if st.button(f"💾 Save Changes to `{os.path.basename(selected_file)}`", type="primary", use_container_width=True):
-        master_df.drop(columns=RANK_COLS, errors="ignore").to_csv(selected_file, index=False)
-        st.success(f"Changes permanently written to `{selected_file}`!")
-        st.cache_data.clear()
+        ok, message = save_merged(selected_file, master_df)
+        if ok:
+            st.cache_data.clear()
+            # Reload what was written, so the table and the change baseline match the file
+            reloaded = read_csv_file(selected_file)
+            st.session_state.df = add_rank_info(reloaded) if reloaded is not None else None
+            remember_loaded(reloaded)
+            close_details()
+            invalidate_view()
+            st.session_state.save_message = message
+            st.rerun()
+        else:
+            st.error(message)
+    if msg := st.session_state.pop("save_message", None):
+        st.success(msg)
 
 with col_dl:
     csv_download_data = master_df.loc[view_base.index].to_csv(index=False).encode("utf-8")
